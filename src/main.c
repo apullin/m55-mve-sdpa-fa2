@@ -5,23 +5,25 @@
 #include "arm_math.h"
 #include "model_data.h"
 
-static q7_t g_hidden_a[INPUT_SEQ_LEN * MODEL_DIM];
-static q7_t g_hidden_b[INPUT_SEQ_LEN * MODEL_DIM];
-static q7_t g_output[OUTPUT_SEQ_LEN * NUM_CLASSES];
+#define ALIGN_16 __attribute__((aligned(16)))
 
-static q7_t g_head_k_cache[INPUT_SEQ_LEN * HEAD_DIM];
-static q7_t g_head_v_cache[INPUT_SEQ_LEN * HEAD_DIM];
-static q7_t g_query_tile[QUERY_TILE * HEAD_DIM];
-static q7_t g_head_context_tile[QUERY_TILE * HEAD_DIM];
-static q7_t g_context_tile[QUERY_TILE * MODEL_DIM];
-static q7_t g_work_tile[QUERY_TILE * MODEL_DIM];
-static q7_t g_residual_tile[QUERY_TILE * MODEL_DIM];
-static q7_t g_classifier_tile[QUERY_TILE * NUM_CLASSES];
-static q7_t g_matmul_state[MODEL_DIM * ((MODEL_DIM > HEAD_DIM) ? MODEL_DIM : HEAD_DIM)];
-static int16_t g_score_tile[QUERY_TILE * KEY_TILE];
-static int16_t g_row_max[QUERY_TILE];
-static int32_t g_row_sum[QUERY_TILE];
-static int32_t g_row_acc[QUERY_TILE * HEAD_DIM];
+static q7_t ALIGN_16 g_hidden_a[INPUT_SEQ_LEN * MODEL_DIM];
+static q7_t ALIGN_16 g_hidden_b[INPUT_SEQ_LEN * MODEL_DIM];
+static q7_t ALIGN_16 g_output[OUTPUT_SEQ_LEN * NUM_CLASSES];
+
+static q7_t ALIGN_16 g_head_k_cache[INPUT_SEQ_LEN * HEAD_DIM];
+static q7_t ALIGN_16 g_head_v_cache[INPUT_SEQ_LEN * HEAD_DIM];
+static q7_t ALIGN_16 g_query_tile[QUERY_TILE * HEAD_DIM];
+static q7_t ALIGN_16 g_head_context_tile[QUERY_TILE * HEAD_DIM];
+static q7_t ALIGN_16 g_context_tile[QUERY_TILE * MODEL_DIM];
+static q7_t ALIGN_16 g_work_tile[QUERY_TILE * MODEL_DIM];
+static q7_t ALIGN_16 g_residual_tile[QUERY_TILE * MODEL_DIM];
+static q7_t ALIGN_16 g_classifier_tile[QUERY_TILE * NUM_CLASSES];
+static q7_t ALIGN_16 g_matmul_state[MODEL_DIM * ((MODEL_DIM > HEAD_DIM) ? MODEL_DIM : HEAD_DIM)];
+static int16_t ALIGN_16 g_score_tile[QUERY_TILE * KEY_TILE];
+static int16_t ALIGN_16 g_row_max[QUERY_TILE];
+static int32_t ALIGN_16 g_row_sum[QUERY_TILE];
+static int32_t ALIGN_16 g_row_acc[QUERY_TILE * HEAD_DIM];
 
 static q7_t sat_q7(int32_t value)
 {
@@ -129,11 +131,82 @@ static void compute_score_tile_q7(
     uint32_t key_rows)
 {
 #if defined(ARM_MATH_MVEI) && !defined(ARM_MATH_AUTOVECTORIZE) && (HEAD_DIM == 16)
-    for (uint32_t q = 0; q < query_rows; ++q) {
+    uint32_t q = 0;
+
+    for (; (q + 3U) < query_rows; q += 4U) {
+        q7x16_t query_vec0 = vld1q(&query_block[(q + 0U) * HEAD_DIM]);
+        q7x16_t query_vec1 = vld1q(&query_block[(q + 1U) * HEAD_DIM]);
+        q7x16_t query_vec2 = vld1q(&query_block[(q + 2U) * HEAD_DIM]);
+        q7x16_t query_vec3 = vld1q(&query_block[(q + 3U) * HEAD_DIM]);
+        int16_t *score_row0 = &g_score_tile[(q + 0U) * KEY_TILE];
+        int16_t *score_row1 = &g_score_tile[(q + 1U) * KEY_TILE];
+        int16_t *score_row2 = &g_score_tile[(q + 2U) * KEY_TILE];
+        int16_t *score_row3 = &g_score_tile[(q + 3U) * KEY_TILE];
+        const q7_t *key_vec = key_block;
+        uint32_t k = 0U;
+
+        for (; (k + 3U) < key_rows; k += 4U) {
+            q7x16_t key_vec0 = vld1q(key_vec + 0U * HEAD_DIM);
+            q7x16_t key_vec1 = vld1q(key_vec + 1U * HEAD_DIM);
+            q7x16_t key_vec2 = vld1q(key_vec + 2U * HEAD_DIM);
+            q7x16_t key_vec3 = vld1q(key_vec + 3U * HEAD_DIM);
+
+            q31_t acc00 = vmladavaq(0, query_vec0, key_vec0);
+            q31_t acc01 = vmladavaq(0, query_vec0, key_vec1);
+            q31_t acc02 = vmladavaq(0, query_vec0, key_vec2);
+            q31_t acc03 = vmladavaq(0, query_vec0, key_vec3);
+            q31_t acc10 = vmladavaq(0, query_vec1, key_vec0);
+            q31_t acc11 = vmladavaq(0, query_vec1, key_vec1);
+            q31_t acc12 = vmladavaq(0, query_vec1, key_vec2);
+            q31_t acc13 = vmladavaq(0, query_vec1, key_vec3);
+            q31_t acc20 = vmladavaq(0, query_vec2, key_vec0);
+            q31_t acc21 = vmladavaq(0, query_vec2, key_vec1);
+            q31_t acc22 = vmladavaq(0, query_vec2, key_vec2);
+            q31_t acc23 = vmladavaq(0, query_vec2, key_vec3);
+            q31_t acc30 = vmladavaq(0, query_vec3, key_vec0);
+            q31_t acc31 = vmladavaq(0, query_vec3, key_vec1);
+            q31_t acc32 = vmladavaq(0, query_vec3, key_vec2);
+            q31_t acc33 = vmladavaq(0, query_vec3, key_vec3);
+
+            score_row0[k + 0U] = (int16_t)(acc00 >> ATTN_SCORE_SHIFT);
+            score_row0[k + 1U] = (int16_t)(acc01 >> ATTN_SCORE_SHIFT);
+            score_row0[k + 2U] = (int16_t)(acc02 >> ATTN_SCORE_SHIFT);
+            score_row0[k + 3U] = (int16_t)(acc03 >> ATTN_SCORE_SHIFT);
+            score_row1[k + 0U] = (int16_t)(acc10 >> ATTN_SCORE_SHIFT);
+            score_row1[k + 1U] = (int16_t)(acc11 >> ATTN_SCORE_SHIFT);
+            score_row1[k + 2U] = (int16_t)(acc12 >> ATTN_SCORE_SHIFT);
+            score_row1[k + 3U] = (int16_t)(acc13 >> ATTN_SCORE_SHIFT);
+            score_row2[k + 0U] = (int16_t)(acc20 >> ATTN_SCORE_SHIFT);
+            score_row2[k + 1U] = (int16_t)(acc21 >> ATTN_SCORE_SHIFT);
+            score_row2[k + 2U] = (int16_t)(acc22 >> ATTN_SCORE_SHIFT);
+            score_row2[k + 3U] = (int16_t)(acc23 >> ATTN_SCORE_SHIFT);
+            score_row3[k + 0U] = (int16_t)(acc30 >> ATTN_SCORE_SHIFT);
+            score_row3[k + 1U] = (int16_t)(acc31 >> ATTN_SCORE_SHIFT);
+            score_row3[k + 2U] = (int16_t)(acc32 >> ATTN_SCORE_SHIFT);
+            score_row3[k + 3U] = (int16_t)(acc33 >> ATTN_SCORE_SHIFT);
+            key_vec += 4U * HEAD_DIM;
+        }
+
+        for (; k < key_rows; ++k) {
+            q7x16_t key_vec0 = vld1q(key_vec);
+            q31_t acc0 = vmladavaq(0, query_vec0, key_vec0);
+            q31_t acc1 = vmladavaq(0, query_vec1, key_vec0);
+            q31_t acc2 = vmladavaq(0, query_vec2, key_vec0);
+            q31_t acc3 = vmladavaq(0, query_vec3, key_vec0);
+
+            score_row0[k] = (int16_t)(acc0 >> ATTN_SCORE_SHIFT);
+            score_row1[k] = (int16_t)(acc1 >> ATTN_SCORE_SHIFT);
+            score_row2[k] = (int16_t)(acc2 >> ATTN_SCORE_SHIFT);
+            score_row3[k] = (int16_t)(acc3 >> ATTN_SCORE_SHIFT);
+            key_vec += HEAD_DIM;
+        }
+    }
+
+    for (; q < query_rows; ++q) {
         q7x16_t query_vec = vld1q(&query_block[q * HEAD_DIM]);
         int16_t *score_row = &g_score_tile[q * KEY_TILE];
         const q7_t *key_vec = key_block;
-        uint32_t k = 0;
+        uint32_t k = 0U;
 
         for (; (k + 3U) < key_rows; k += 4U) {
             q31_t acc0 = vmladavaq(0, query_vec, vld1q(key_vec + 0U * HEAD_DIM));
