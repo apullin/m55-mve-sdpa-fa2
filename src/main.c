@@ -1,4 +1,3 @@
-#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -143,9 +142,28 @@ static void init_row_acc_from_value_q12(int32_t *acc, const q7_t *value_vec)
 
 static void scale_row_acc_q12_inplace(int32_t *acc, uint16_t alpha_q12)
 {
+#if defined(ARM_MATH_MVEI) && !defined(ARM_MATH_AUTOVECTORIZE) && (HEAD_DIM == 16)
+    q31x4_t alpha = vdupq_n_s32((int32_t)alpha_q12);
+    q31x4_t round = vdupq_n_s32(SOFTMAX_Q12_ONE / 2);
+    q31x4_t acc0 = vld1q(acc + 0);
+    q31x4_t acc1 = vld1q(acc + 4);
+    q31x4_t acc2 = vld1q(acc + 8);
+    q31x4_t acc3 = vld1q(acc + 12);
+
+    acc0 = vshrq(vaddq(vmulq(acc0, alpha), round), 12);
+    acc1 = vshrq(vaddq(vmulq(acc1, alpha), round), 12);
+    acc2 = vshrq(vaddq(vmulq(acc2, alpha), round), 12);
+    acc3 = vshrq(vaddq(vmulq(acc3, alpha), round), 12);
+
+    vstrwq_s32(acc + 0, acc0);
+    vstrwq_s32(acc + 4, acc1);
+    vstrwq_s32(acc + 8, acc2);
+    vstrwq_s32(acc + 12, acc3);
+#else
     for (uint32_t d = 0; d < HEAD_DIM; ++d) {
         acc[d] = (acc[d] * alpha_q12 + (SOFTMAX_Q12_ONE / 2)) >> 12;
     }
+#endif
 }
 
 static void add_weighted_value_q12(int32_t *acc, const q7_t *value_vec, uint16_t weight_q12)
@@ -238,49 +256,55 @@ static void run_attention_head_block_with_cache(
     /* Apply RoPE to the active query tile using absolute token positions. */
     apply_rope_q7_inplace(g_query_tile, query_rows, query_start);
 
-    /* Reset the FlashAttention-style running max, sum, and value accumulator. */
+    /* Seed each query row from the first key so the steady-state loop has no empty-row branch. */
     for (uint32_t q = 0; q < query_rows; ++q) {
-        g_row_max[q] = INT16_MIN;
-        g_row_sum[q] = 0;
-        for (uint32_t d = 0; d < HEAD_DIM; ++d) {
-            g_row_acc[q * HEAD_DIM + d] = 0;
-        }
+        const q7_t *query_vec = &g_query_tile[q * HEAD_DIM];
+        const q7_t *first_key_vec = &g_head_k_cache[0];
+        const q7_t *first_value_vec = &g_head_v_cache[0];
+
+        g_row_max[q] = dot_q7_head(query_vec, first_key_vec);
+        g_row_sum[q] = SOFTMAX_Q12_ONE;
+        init_row_acc_from_value_q12(&g_row_acc[q * HEAD_DIM], first_value_vec);
     }
 
     for (uint32_t key_start = 0; key_start < INPUT_SEQ_LEN; key_start += KEY_TILE) {
+        uint32_t key_offset = (key_start == 0U) ? 1U : 0U;
         uint32_t key_rows = min_u32(KEY_TILE, INPUT_SEQ_LEN - key_start);
+        const q7_t *key_tile = &g_head_k_cache[key_start * HEAD_DIM];
+        const q7_t *value_tile = &g_head_v_cache[key_start * HEAD_DIM];
 
         for (uint32_t q = 0; q < query_rows; ++q) {
             const q7_t *query_vec = &g_query_tile[q * HEAD_DIM];
+            int16_t row_max = g_row_max[q];
+            int32_t row_sum = g_row_sum[q];
+            int32_t *row_acc = &g_row_acc[q * HEAD_DIM];
+            const q7_t *key_vec = key_tile + key_offset * HEAD_DIM;
+            const q7_t *value_vec = value_tile + key_offset * HEAD_DIM;
 
-            for (uint32_t k = 0; k < key_rows; ++k) {
-                const q7_t *key_vec = &g_head_k_cache[(key_start + k) * HEAD_DIM];
-                const q7_t *value_vec = &g_head_v_cache[(key_start + k) * HEAD_DIM];
+            for (uint32_t k = key_offset; k < key_rows; ++k) {
                 int16_t score = dot_q7_head(query_vec, key_vec);
                 uint16_t weight_q12;
 
                 /* Update the online softmax max and renormalize old partial sums if the max grows. */
-                if (g_row_sum[q] == 0) {
-                    g_row_max[q] = score;
-                    g_row_sum[q] = SOFTMAX_Q12_ONE;
-                    init_row_acc_from_value_q12(&g_row_acc[q * HEAD_DIM], value_vec);
-                    continue;
-                }
-
-                if (score > g_row_max[q]) {
-                    uint16_t alpha_q12 = softmax_decay_q12((int32_t)score - g_row_max[q]);
-                    g_row_sum[q] = (g_row_sum[q] * alpha_q12 + (SOFTMAX_Q12_ONE / 2)) >> 12;
-                    scale_row_acc_q12_inplace(&g_row_acc[q * HEAD_DIM], alpha_q12);
-                    g_row_max[q] = score;
+                if (score > row_max) {
+                    uint16_t alpha_q12 = softmax_decay_q12((int32_t)score - row_max);
+                    row_sum = (row_sum * alpha_q12 + (SOFTMAX_Q12_ONE / 2)) >> 12;
+                    scale_row_acc_q12_inplace(row_acc, alpha_q12);
+                    row_max = score;
                     weight_q12 = SOFTMAX_Q12_ONE;
                 } else {
-                    weight_q12 = softmax_decay_q12((int32_t)g_row_max[q] - score);
+                    weight_q12 = softmax_decay_q12((int32_t)row_max - score);
                 }
 
                 /* Fold the new V contribution into the unnormalized weighted output. */
-                g_row_sum[q] += weight_q12;
-                add_weighted_value_q12(&g_row_acc[q * HEAD_DIM], value_vec, weight_q12);
+                row_sum += weight_q12;
+                add_weighted_value_q12(row_acc, value_vec, weight_q12);
+                key_vec += HEAD_DIM;
+                value_vec += HEAD_DIM;
             }
+
+            g_row_max[q] = row_max;
+            g_row_sum[q] = row_sum;
         }
     }
 
