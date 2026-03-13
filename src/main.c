@@ -18,6 +18,7 @@ static q7_t g_work_tile[QUERY_TILE * MODEL_DIM];
 static q7_t g_residual_tile[QUERY_TILE * MODEL_DIM];
 static q7_t g_classifier_tile[QUERY_TILE * NUM_CLASSES];
 static q7_t g_matmul_state[MODEL_DIM * ((MODEL_DIM > HEAD_DIM) ? MODEL_DIM : HEAD_DIM)];
+static int16_t g_score_tile[QUERY_TILE * KEY_TILE];
 static int16_t g_row_max[QUERY_TILE];
 static int32_t g_row_sum[QUERY_TILE];
 static int32_t g_row_acc[QUERY_TILE * HEAD_DIM];
@@ -119,6 +120,50 @@ static int16_t dot_q7_head(const q7_t *a, const q7_t *b)
     arm_dot_prod_q7(a, b, HEAD_DIM, &score_acc);
 #endif
     return (int16_t)(score_acc >> ATTN_SCORE_SHIFT);
+}
+
+static void compute_score_tile_q7(
+    const q7_t *query_block,
+    const q7_t *key_block,
+    uint32_t query_rows,
+    uint32_t key_rows)
+{
+#if defined(ARM_MATH_MVEI) && !defined(ARM_MATH_AUTOVECTORIZE) && (HEAD_DIM == 16)
+    for (uint32_t q = 0; q < query_rows; ++q) {
+        q7x16_t query_vec = vld1q(&query_block[q * HEAD_DIM]);
+        int16_t *score_row = &g_score_tile[q * KEY_TILE];
+        const q7_t *key_vec = key_block;
+        uint32_t k = 0;
+
+        for (; (k + 3U) < key_rows; k += 4U) {
+            q31_t acc0 = vmladavaq(0, query_vec, vld1q(key_vec + 0U * HEAD_DIM));
+            q31_t acc1 = vmladavaq(0, query_vec, vld1q(key_vec + 1U * HEAD_DIM));
+            q31_t acc2 = vmladavaq(0, query_vec, vld1q(key_vec + 2U * HEAD_DIM));
+            q31_t acc3 = vmladavaq(0, query_vec, vld1q(key_vec + 3U * HEAD_DIM));
+
+            score_row[k + 0U] = (int16_t)(acc0 >> ATTN_SCORE_SHIFT);
+            score_row[k + 1U] = (int16_t)(acc1 >> ATTN_SCORE_SHIFT);
+            score_row[k + 2U] = (int16_t)(acc2 >> ATTN_SCORE_SHIFT);
+            score_row[k + 3U] = (int16_t)(acc3 >> ATTN_SCORE_SHIFT);
+            key_vec += 4U * HEAD_DIM;
+        }
+
+        for (; k < key_rows; ++k) {
+            q31_t acc = vmladavaq(0, query_vec, vld1q(key_vec));
+            score_row[k] = (int16_t)(acc >> ATTN_SCORE_SHIFT);
+            key_vec += HEAD_DIM;
+        }
+    }
+#else
+    for (uint32_t q = 0; q < query_rows; ++q) {
+        const q7_t *query_vec = &query_block[q * HEAD_DIM];
+        int16_t *score_row = &g_score_tile[q * KEY_TILE];
+
+        for (uint32_t k = 0; k < key_rows; ++k) {
+            score_row[k] = dot_q7_head(query_vec, &key_block[k * HEAD_DIM]);
+        }
+    }
+#endif
 }
 
 static void init_row_acc_from_value_q12(int32_t *acc, const q7_t *value_vec)
@@ -336,16 +381,18 @@ static void run_attention_head_block_with_cache(
         const q7_t *key_tile = &g_head_k_cache[key_start * HEAD_DIM];
         const q7_t *value_tile = &g_head_v_cache[key_start * HEAD_DIM];
 
+        /* Materialize one exact score tile so softmax/value folding can stream over cached scores. */
+        compute_score_tile_q7(g_query_tile, key_tile, query_rows, key_rows);
+
         for (uint32_t q = 0; q < query_rows; ++q) {
-            const q7_t *query_vec = &g_query_tile[q * HEAD_DIM];
+            const int16_t *score_row = &g_score_tile[q * KEY_TILE];
             int16_t row_max = g_row_max[q];
             int32_t row_sum = g_row_sum[q];
             int32_t *row_acc = &g_row_acc[q * HEAD_DIM];
-            const q7_t *key_vec = key_tile + key_offset * HEAD_DIM;
             const q7_t *value_vec = value_tile + key_offset * HEAD_DIM;
 
             for (uint32_t k = key_offset; k < key_rows; ++k) {
-                int16_t score = dot_q7_head(query_vec, key_vec);
+                int16_t score = score_row[k];
                 uint16_t weight_q12;
 
                 /* Update the online softmax max and renormalize old partial sums if the max grows. */
@@ -362,7 +409,6 @@ static void run_attention_head_block_with_cache(
                 /* Fold the new V contribution into the unnormalized weighted output. */
                 row_sum += weight_q12;
                 add_weighted_value_q12(row_acc, value_vec, weight_q12);
-                key_vec += HEAD_DIM;
                 value_vec += HEAD_DIM;
             }
 
