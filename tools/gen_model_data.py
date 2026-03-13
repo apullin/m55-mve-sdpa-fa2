@@ -125,13 +125,10 @@ def render_header(
 ) -> str:
     if attn_dim % num_heads != 0:
         raise ValueError("attn_dim must be divisible by num_heads")
-    if input_seq_len % 2 != 0:
-        raise ValueError("input_seq_len must be even for 2:1 pooling")
 
     head_dim = attn_dim // num_heads
     if head_dim % 2 != 0:
         raise ValueError("head_dim must be even for RoPE")
-    pooled_seq_len = input_seq_len // 2
     layers = [
         generate_layer(0x12345678 + 0x10203 * layer_idx, model_dim, num_heads, head_dim)
         for layer_idx in range(num_layers)
@@ -157,7 +154,7 @@ def render_header(
 #define HEAD_DIM {head_dim}
 #define NUM_LAYERS {num_layers}
 #define INPUT_SEQ_LEN {input_seq_len}
-#define POOLED_SEQ_LEN {pooled_seq_len}
+#define OUTPUT_SEQ_LEN INPUT_SEQ_LEN
 #define NUM_CLASSES {num_classes}
 #define QUERY_TILE {query_tile}
 #define KEY_TILE {key_tile}
@@ -201,7 +198,7 @@ def main() -> int:
     parser.add_argument("--attn-dim", type=int, default=32)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-layers", type=int, default=3)
-    parser.add_argument("--input-seq-len", type=int, default=2250)
+    parser.add_argument("--input-seq-len", type=int, default=1200)
     parser.add_argument("--num-classes", type=int, default=4)
     parser.add_argument("--query-tile", type=int, default=30)
     parser.add_argument("--key-tile", type=int, default=150)

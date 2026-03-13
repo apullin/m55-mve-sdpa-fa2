@@ -8,7 +8,7 @@
 
 static q7_t g_hidden_a[INPUT_SEQ_LEN * MODEL_DIM];
 static q7_t g_hidden_b[INPUT_SEQ_LEN * MODEL_DIM];
-static q7_t g_output[POOLED_SEQ_LEN * NUM_CLASSES];
+static q7_t g_output[OUTPUT_SEQ_LEN * NUM_CLASSES];
 
 static q7_t g_head_k_cache[INPUT_SEQ_LEN * HEAD_DIM];
 static q7_t g_head_v_cache[INPUT_SEQ_LEN * HEAD_DIM];
@@ -17,7 +17,6 @@ static q7_t g_head_context_tile[QUERY_TILE * HEAD_DIM];
 static q7_t g_context_tile[QUERY_TILE * MODEL_DIM];
 static q7_t g_work_tile[QUERY_TILE * MODEL_DIM];
 static q7_t g_residual_tile[QUERY_TILE * MODEL_DIM];
-static q7_t g_pooled_tile[QUERY_TILE * MODEL_DIM];
 static q7_t g_classifier_tile[QUERY_TILE * NUM_CLASSES];
 static q7_t g_matmul_state[MODEL_DIM * ((MODEL_DIM > HEAD_DIM) ? MODEL_DIM : HEAD_DIM)];
 static int16_t g_row_max[QUERY_TILE];
@@ -359,26 +358,15 @@ static void run_transformer_layer(const q7_t *current_sequence, q7_t *next_seque
     }
 }
 
-static void pool_and_classify(const q7_t *sequence, q7_t *output)
+static void classify_sequence(const q7_t *sequence, q7_t *output)
 {
-    for (uint32_t pooled_start = 0; pooled_start < POOLED_SEQ_LEN; pooled_start += QUERY_TILE) {
-        uint32_t pooled_rows = min_u32(QUERY_TILE, POOLED_SEQ_LEN - pooled_start);
+    for (uint32_t output_start = 0; output_start < OUTPUT_SEQ_LEN; output_start += QUERY_TILE) {
+        uint32_t output_rows = min_u32(QUERY_TILE, OUTPUT_SEQ_LEN - output_start);
 
-        /* Average adjacent tokens so the sequence shrinks 2250 -> 1125. */
-        for (uint32_t row = 0; row < pooled_rows; ++row) {
-            uint32_t src_row = (pooled_start + row) * 2U;
-
-            for (uint32_t col = 0; col < MODEL_DIM; ++col) {
-                int32_t a = sequence[src_row * MODEL_DIM + col];
-                int32_t b = sequence[(src_row + 1U) * MODEL_DIM + col];
-                g_pooled_tile[row * MODEL_DIM + col] = sat_q7((a + b) / 2);
-            }
-        }
-
-        /* Apply the 24->4 output classifier on the pooled tile. */
+        /* Apply the 24->4 output classifier directly on the final sequence tile. */
         q7_linear_block(
-            g_pooled_tile,
-            (uint16_t)pooled_rows,
+            sequence + output_start * MODEL_DIM,
+            (uint16_t)output_rows,
             MODEL_DIM,
             &g_classifier_w[0][0],
             NUM_CLASSES,
@@ -387,8 +375,8 @@ static void pool_and_classify(const q7_t *sequence, q7_t *output)
 
         arm_copy_q7(
             g_classifier_tile,
-            output + pooled_start * NUM_CLASSES,
-            pooled_rows * NUM_CLASSES);
+            output + output_start * NUM_CLASSES,
+            output_rows * NUM_CLASSES);
     }
 }
 
@@ -406,8 +394,8 @@ static void run_model(q7_t *buffer_a, q7_t *buffer_b, q7_t *output)
         next = tmp;
     }
 
-    /* Pool adjacent tokens and emit the four class logits. */
-    pool_and_classify(current, output);
+    /* Emit one 24->4 classifier row per final sequence position. */
+    classify_sequence(current, output);
 }
 
 int main(void)
@@ -426,7 +414,7 @@ int main(void)
     run_model(g_hidden_a, g_hidden_b, g_output);
 
     /* Print a small prefix of the logits so the binary has a visible result. */
-    for (uint32_t row = 0; row < 8; ++row) {
+    for (uint32_t row = 0; row < min_u32(8U, OUTPUT_SEQ_LEN); ++row) {
         printf("%4lu:", (unsigned long)row);
         for (uint32_t col = 0; col < NUM_CLASSES; ++col) {
             q7_t value = g_output[row * NUM_CLASSES + col];
@@ -436,7 +424,7 @@ int main(void)
         printf("\n");
     }
 
-    for (uint32_t row = 8; row < POOLED_SEQ_LEN; ++row) {
+    for (uint32_t row = 8; row < OUTPUT_SEQ_LEN; ++row) {
         for (uint32_t col = 0; col < NUM_CLASSES; ++col) {
             checksum = checksum * 131u + (uint8_t)g_output[row * NUM_CLASSES + col];
         }

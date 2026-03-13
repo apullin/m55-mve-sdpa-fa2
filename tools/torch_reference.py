@@ -30,7 +30,7 @@ class ModelConfig:
     attn_dim: int = 32
     num_heads: int = 2
     num_layers: int = 3
-    input_seq_len: int = 2250
+    input_seq_len: int = 1200
     num_classes: int = 4
     query_tile: int = 30
     key_tile: int = 150
@@ -38,11 +38,6 @@ class ModelConfig:
     @property
     def head_dim(self) -> int:
         return self.attn_dim // self.num_heads
-
-    @property
-    def pooled_seq_len(self) -> int:
-        return self.input_seq_len // 2
-
 
 class XorShift32:
     def __init__(self, seed: int) -> None:
@@ -106,8 +101,6 @@ class EdgeReferenceModel(nn.Module):
             raise ValueError("attn_dim must be divisible by num_heads")
         if cfg.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        if cfg.input_seq_len % 2 != 0:
-            raise ValueError("input_seq_len must be even for 2:1 pooling")
 
         self.cfg = cfg
         self.layers = nn.ModuleList(
@@ -277,16 +270,13 @@ class EdgeReferenceModel(nn.Module):
 
         return next_sequence
 
-    def pool_and_classify(self, sequence: torch.Tensor) -> torch.Tensor:
-        output = torch.empty((self.cfg.pooled_seq_len, self.cfg.num_classes), dtype=torch.int32)
+    def classify_sequence(self, sequence: torch.Tensor) -> torch.Tensor:
+        output = torch.empty((self.cfg.input_seq_len, self.cfg.num_classes), dtype=torch.int32)
 
-        for pooled_start in range(0, self.cfg.pooled_seq_len, self.cfg.query_tile):
-            pooled_rows = min(self.cfg.query_tile, self.cfg.pooled_seq_len - pooled_start)
-            src = sequence[pooled_start * 2 : pooled_start * 2 + pooled_rows * 2]
-            paired = src.reshape(pooled_rows, 2, self.cfg.model_dim).to(torch.int32)
-            pooled = sat_q7(torch.div(paired[:, 0] + paired[:, 1], 2, rounding_mode="trunc"))
-            output[pooled_start : pooled_start + pooled_rows] = self.q7_linear_block(
-                pooled, self.classifier_w, self.classifier_b
+        for output_start in range(0, self.cfg.input_seq_len, self.cfg.query_tile):
+            output_rows = min(self.cfg.query_tile, self.cfg.input_seq_len - output_start)
+            output[output_start : output_start + output_rows] = self.q7_linear_block(
+                sequence[output_start : output_start + output_rows], self.classifier_w, self.classifier_b
             )
 
         return output
@@ -295,7 +285,7 @@ class EdgeReferenceModel(nn.Module):
         current = sat_q7(sequence)
         for layer in self.layers:
             current = self.run_transformer_layer(current, layer)
-        return self.pool_and_classify(current).to(torch.int8)
+        return self.classify_sequence(current).to(torch.int8)
 
 
 def checksum_q7(data: torch.Tensor) -> int:
