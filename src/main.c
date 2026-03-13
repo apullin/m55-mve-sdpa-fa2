@@ -25,10 +25,12 @@ static q7_t ALIGN_16 g_query_tile[QUERY_TILE * HEAD_DIM];
 static q7_t ALIGN_16 g_head_context_tile[QUERY_TILE * HEAD_DIM];
 static q7_t ALIGN_16 g_context_tile[QUERY_TILE * MODEL_DIM];
 static q7_t ALIGN_16 g_norm_tile[QUERY_TILE * MODEL_DIM];
-static q7_t ALIGN_16 g_work_tile[QUERY_TILE * MODEL_DIM];
+static q7_t ALIGN_16 g_work_tile[QUERY_TILE * FFN_DIM];
 static q7_t ALIGN_16 g_residual_tile[QUERY_TILE * MODEL_DIM];
 static q7_t ALIGN_16 g_classifier_tile[QUERY_TILE * NUM_CLASSES];
-static q7_t ALIGN_16 g_matmul_state[MODEL_DIM * ((MODEL_DIM > HEAD_DIM) ? MODEL_DIM : HEAD_DIM)];
+static q7_t ALIGN_16 g_matmul_state[MODEL_DIM * (((FFN_DIM > HEAD_DIM) ? FFN_DIM : HEAD_DIM) > MODEL_DIM
+    ? ((FFN_DIM > HEAD_DIM) ? FFN_DIM : HEAD_DIM)
+    : MODEL_DIM)];
 static int16_t ALIGN_16 g_score_tile[QUERY_TILE * KEY_TILE];
 static int16_t ALIGN_16 g_row_max[QUERY_TILE];
 static int32_t ALIGN_16 g_row_sum[QUERY_TILE];
@@ -876,24 +878,24 @@ static void run_transformer_layer(
             layer->rms_ffn_w_q14,
             g_norm_tile);
 
-        /* Apply the first 24->24 feed-forward projection on the normalized residual tile. */
+        /* Apply the widened 24->FFN_DIM feed-forward projection on the normalized residual tile. */
         q7_linear_block(
             g_norm_tile,
             (uint16_t)query_rows,
             MODEL_DIM,
             &layer->w_ff1[0][0],
-            MODEL_DIM,
+            FFN_DIM,
             layer->b_ff1,
             g_work_tile);
 
-        /* Apply the non-linearity before the second 24->24 projection. */
-        relu_q7_inplace(g_work_tile, tile_elems);
+        /* Apply the non-linearity across the widened hidden channels. */
+        relu_q7_inplace(g_work_tile, query_rows * FFN_DIM);
 
         /* Project back to the model width and reuse the tile scratch as FFN output. */
         q7_linear_block(
             g_work_tile,
             (uint16_t)query_rows,
-            MODEL_DIM,
+            FFN_DIM,
             &layer->w_ff2[0][0],
             MODEL_DIM,
             layer->b_ff2,

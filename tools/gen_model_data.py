@@ -71,7 +71,7 @@ def make_rms_weight_q14(rng: XorShift32, length: int, spread: int = 2048) -> lis
     return weights
 
 
-def generate_layer(seed: int, model_dim: int, num_heads: int, head_dim: int) -> dict[str, list]:
+def generate_layer(seed: int, model_dim: int, num_heads: int, head_dim: int, ffn_dim: int) -> dict[str, list]:
     rng = XorShift32(seed)
     attn_dim = num_heads * head_dim
     return {
@@ -82,9 +82,9 @@ def generate_layer(seed: int, model_dim: int, num_heads: int, head_dim: int) -> 
         "w_o": make_tensor(rng, (attn_dim, model_dim), magnitude=8, zero_mask=0x7),
         "b_o": make_tensor(rng, (model_dim,), magnitude=2, zero_mask=0x1),
         "rms_ffn_w_q14": make_rms_weight_q14(rng, model_dim),
-        "w_ff1": make_tensor(rng, (model_dim, model_dim), magnitude=9, zero_mask=0x7),
-        "b_ff1": make_tensor(rng, (model_dim,), magnitude=2, zero_mask=0x1),
-        "w_ff2": make_tensor(rng, (model_dim, model_dim), magnitude=8, zero_mask=0x7),
+        "w_ff1": make_tensor(rng, (model_dim, ffn_dim), magnitude=9, zero_mask=0x7),
+        "b_ff1": make_tensor(rng, (ffn_dim,), magnitude=2, zero_mask=0x1),
+        "w_ff2": make_tensor(rng, (ffn_dim, model_dim), magnitude=8, zero_mask=0x7),
         "b_ff2": make_tensor(rng, (model_dim,), magnitude=2, zero_mask=0x1),
     }
 
@@ -128,6 +128,7 @@ def build_rope_tables(input_seq_len: int, head_dim: int) -> tuple[list[list[int]
 def render_header(
     model_dim: int,
     attn_dim: int,
+    ffn_dim: int,
     num_heads: int,
     num_layers: int,
     input_seq_len: int,
@@ -142,7 +143,7 @@ def render_header(
     if head_dim % 2 != 0:
         raise ValueError("head_dim must be even for RoPE")
     layers = [
-        generate_layer(0x12345678 + 0x10203 * layer_idx, model_dim, num_heads, head_dim)
+        generate_layer(0x12345678 + 0x10203 * layer_idx, model_dim, num_heads, head_dim, ffn_dim)
         for layer_idx in range(num_layers)
     ]
     classifier_rng = XorShift32(0xCAFEBABE)
@@ -162,6 +163,7 @@ def render_header(
 
 #define MODEL_DIM {model_dim}
 #define ATTN_DIM {attn_dim}
+#define FFN_DIM {ffn_dim}
 #define NUM_HEADS {num_heads}
 #define HEAD_DIM {head_dim}
 #define NUM_LAYERS {num_layers}
@@ -187,9 +189,9 @@ typedef struct
     q7_t w_o[ATTN_DIM][MODEL_DIM];
     q7_t b_o[MODEL_DIM];
     int16_t rms_ffn_w_q14[MODEL_DIM];
-    q7_t w_ff1[MODEL_DIM][MODEL_DIM];
-    q7_t b_ff1[MODEL_DIM];
-    q7_t w_ff2[MODEL_DIM][MODEL_DIM];
+    q7_t w_ff1[MODEL_DIM][FFN_DIM];
+    q7_t b_ff1[FFN_DIM];
+    q7_t w_ff2[FFN_DIM][MODEL_DIM];
     q7_t b_ff2[MODEL_DIM];
 }} model_layer_t;
 
@@ -212,6 +214,7 @@ def main() -> int:
     parser.add_argument("output_header")
     parser.add_argument("--model-dim", type=int, default=24)
     parser.add_argument("--attn-dim", type=int, default=32)
+    parser.add_argument("--ffn-dim", type=int, default=48)
     parser.add_argument("--num-heads", type=int, default=2)
     parser.add_argument("--num-layers", type=int, default=3)
     parser.add_argument("--input-seq-len", type=int, default=1200)
@@ -225,6 +228,7 @@ def main() -> int:
         render_header(
             model_dim=args.model_dim,
             attn_dim=args.attn_dim,
+            ffn_dim=args.ffn_dim,
             num_heads=args.num_heads,
             num_layers=args.num_layers,
             input_seq_len=args.input_seq_len,

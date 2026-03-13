@@ -9,10 +9,11 @@ The current target model is:
 - blocks: `3`
 - external model width: `24`
 - internal attention width: `32`
+- feed-forward hidden width: `48`
 - heads: `2`
 - head width: `16`
 - attention path per block: `24 -> 32 -> 24`
-- feed-forward path per block: `24 -> 24 -> 24`
+- feed-forward path per block: `24 -> 48 -> 24`
 - normalization: pre-RMSNorm before attention and before FFN
 - position encoding: RoPE on `Q` and `K` with baked q15 sin/cos tables
 - tile sizes: `QUERY_TILE=30`, `KEY_TILE=150`
@@ -25,6 +26,8 @@ This is full attention, not local attention and not architectural chunking. Ever
 - `tools/gen_model_data.py`: deterministic int8 parameter generator plus q12 softmax LUT and q15 RoPE table generator
 - `tools/torch_reference.py`: PyTorch mirror of the fixed-point edge path
 - `cmake/toolchains/arm-none-eabi-gcc.cmake`: Cortex-M55 cross-build setup
+
+The FFN width is configurable at build time with `-DMODEL_FFN_DIM=...` without changing the low-memory execution schedule.
 
 ## Shapes And Dataflow
 
@@ -43,7 +46,7 @@ Each transformer block runs in two phases:
    add output bias
    add the residual
    apply pre-RMSNorm to the residual
-   run the `24 -> 24 -> 24` feed-forward block
+   run the widened `24 -> 48 -> 24` feed-forward block
    write the final tile back to the spare sequence buffer
 
 After the last block, the model applies one direct `24 -> 4` classifier row by row.

@@ -34,6 +34,7 @@ import gen_model_data as modelgen
 class ModelConfig:
     model_dim: int = 24
     attn_dim: int = 32
+    ffn_dim: int = 48
     num_heads: int = 2
     num_layers: int = 3
     input_seq_len: int = 1200
@@ -120,7 +121,13 @@ class EdgeReferenceModel(nn.Module):
         self.cfg = cfg
         self.layers = nn.ModuleList(
             ReferenceLayer(
-                modelgen.generate_layer(0x12345678 + 0x10203 * layer_idx, cfg.model_dim, cfg.num_heads, cfg.head_dim)
+                modelgen.generate_layer(
+                    0x12345678 + 0x10203 * layer_idx,
+                    cfg.model_dim,
+                    cfg.num_heads,
+                    cfg.head_dim,
+                    cfg.ffn_dim,
+                )
             )
             for layer_idx in range(cfg.num_layers)
         )
@@ -334,6 +341,7 @@ def checksum_q7(data: torch.Tensor) -> int:
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-seq-len", type=int, default=128, help="Sequence length for the demo run")
+    parser.add_argument("--ffn-dim", type=int, default=48, help="Feed-forward hidden width")
     parser.add_argument("--dropout-p", type=float, default=0.0, help="Training-only dropout probability for the Python path")
     parser.add_argument("--dump-output", type=Path, default=None, help="Optional path to write raw q7 output bytes")
     return parser.parse_args(argv)
@@ -341,7 +349,7 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
-    cfg = ModelConfig(input_seq_len=args.input_seq_len, dropout_p=args.dropout_p)
+    cfg = ModelConfig(input_seq_len=args.input_seq_len, ffn_dim=args.ffn_dim, dropout_p=args.dropout_p)
     model = EdgeReferenceModel(cfg)
     model.eval()
     sequence = build_demo_input(cfg)

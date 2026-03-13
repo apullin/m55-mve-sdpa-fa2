@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
         help="PyTorch reference script",
     )
     parser.add_argument("--input-seq-len", type=int, default=1200)
+    parser.add_argument("--ffn-dim", type=int, default=48)
     parser.add_argument("--num-classes", type=int, default=4)
     parser.add_argument(
         "--max-abs-diff",
@@ -97,6 +98,8 @@ def main() -> int:
                 str(args.torch_script),
                 "--input-seq-len",
                 str(args.input_seq_len),
+                "--ffn-dim",
+                str(args.ffn_dim),
                 "--dump-output",
                 str(py_dump),
             ]

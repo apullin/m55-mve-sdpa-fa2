@@ -13,6 +13,7 @@ set(ARM_FLOAT_ABI "hard" CACHE STRING "Floating-point ABI for Cortex-M55 cross b
 
 set(MODEL_DIM 24 CACHE STRING "Model feature dimension")
 set(MODEL_ATTN_DIM 32 CACHE STRING "Internal attention width")
+set(MODEL_FFN_DIM 48 CACHE STRING "Feed-forward hidden width")
 set(MODEL_NUM_HEADS 2 CACHE STRING "Number of attention heads")
 set(MODEL_NUM_LAYERS 3 CACHE STRING "Number of stacked attention layers")
 set(MODEL_INPUT_SEQ_LEN 1200 CACHE STRING "Input sequence length")
@@ -79,6 +80,7 @@ set(MODEL_DATA_HEADER "${GENERATED_DIR}/model_data.h")
 set(GEN_MODEL_ARGS
   --model-dim "${MODEL_DIM}"
   --attn-dim "${MODEL_ATTN_DIM}"
+  --ffn-dim "${MODEL_FFN_DIM}"
   --num-heads "${MODEL_NUM_HEADS}"
   --num-layers "${MODEL_NUM_LAYERS}"
   --input-seq-len "${MODEL_INPUT_SEQ_LEN}"
