@@ -7,10 +7,12 @@
 
 #define ALIGN_16 __attribute__((aligned(16)))
 
+/* Two full sequence buffers are the main working set that get swapped layer by layer. */
 static q7_t ALIGN_16 g_hidden_a[INPUT_SEQ_LEN * MODEL_DIM];
 static q7_t ALIGN_16 g_hidden_b[INPUT_SEQ_LEN * MODEL_DIM];
 static q7_t ALIGN_16 g_output[OUTPUT_SEQ_LEN * NUM_CLASSES];
 
+/* Per-head caches and per-tile scratch keep the attention path streaming and low-memory. */
 static q7_t ALIGN_16 g_head_k_cache[INPUT_SEQ_LEN * HEAD_DIM];
 static q7_t ALIGN_16 g_head_v_cache[INPUT_SEQ_LEN * HEAD_DIM];
 static q7_t ALIGN_16 g_query_tile[QUERY_TILE * HEAD_DIM];
@@ -130,10 +132,12 @@ static void compute_score_tile_q7(
     uint32_t query_rows,
     uint32_t key_rows)
 {
+    /* Compute one exact Q.K^T tile into int16 scratch before the online softmax pass. */
 #if defined(ARM_MATH_MVEI) && !defined(ARM_MATH_AUTOVECTORIZE) && (HEAD_DIM == 16)
     uint32_t q = 0;
 
     for (; (q + 3U) < query_rows; q += 4U) {
+        /* 4x4 microkernel: reuse four query rows and four key rows across 16 score accumulations. */
         q7x16_t query_vec0 = vld1q(&query_block[(q + 0U) * HEAD_DIM]);
         q7x16_t query_vec1 = vld1q(&query_block[(q + 1U) * HEAD_DIM]);
         q7x16_t query_vec2 = vld1q(&query_block[(q + 2U) * HEAD_DIM]);
@@ -325,6 +329,7 @@ static void normalize_row_acc_to_q7(const int32_t *row_acc, int32_t row_sum, q7_
         return;
     }
 
+    /* Convert the unnormalized q12-weighted V sum back to q7 with symmetric rounding. */
 #if defined(ARM_MATH_MVEI) && !defined(ARM_MATH_AUTOVECTORIZE) && (HEAD_DIM == 16)
     q31x4_t half = vdupq_n_s32(row_sum / 2);
 
@@ -368,6 +373,7 @@ static void apply_rope_q7_inplace(q7_t *data, uint32_t rows, uint32_t start_pos)
         const q15_t *cos_ptr = &g_rope_cos_q15[pos][0];
         const q15_t *sin_ptr = &g_rope_sin_q15[pos][0];
 
+        /* Rotate four complex pairs at a time with precomputed q15 sin/cos tables. */
         for (uint32_t pair = 0; pair < ROPE_PAIR_DIM; pair += 4) {
             const int8_t *pair_ptr = (const int8_t *)(row_ptr + 2U * pair);
             q31x4_t x0 = vldrbq_gather_offset_s32(pair_ptr, even_offsets);
@@ -454,7 +460,7 @@ static void run_attention_head_block_with_cache(
         const q7_t *key_tile = &g_head_k_cache[key_start * HEAD_DIM];
         const q7_t *value_tile = &g_head_v_cache[key_start * HEAD_DIM];
 
-        /* Materialize one exact score tile so softmax/value folding can stream over cached scores. */
+        /* Materialize one exact score tile, then stream the online softmax/value update over it. */
         compute_score_tile_q7(g_query_tile, key_tile, query_rows, key_rows);
 
         for (uint32_t q = 0; q < query_rows; ++q) {
@@ -527,7 +533,7 @@ static void build_head_kv_cache(const q7_t *input_sequence, const model_layer_t 
 
 static void run_transformer_layer(const q7_t *current_sequence, q7_t *next_sequence, const model_layer_t *layer)
 {
-    /* Accumulate the output-projected attention result directly into the next 24-wide sequence buffer. */
+    /* First phase: accumulate all head outputs into the next 24-wide sequence buffer. */
     arm_fill_q7(0, next_sequence, INPUT_SEQ_LEN * MODEL_DIM);
 
     for (uint32_t head_idx = 0; head_idx < NUM_HEADS; ++head_idx) {
@@ -564,6 +570,7 @@ static void run_transformer_layer(const q7_t *current_sequence, q7_t *next_seque
         }
     }
 
+    /* Second phase: apply output bias, residual, and the 24->24->24 feed-forward block tile by tile. */
     for (uint32_t query_start = 0; query_start < INPUT_SEQ_LEN; query_start += QUERY_TILE) {
         uint32_t query_rows = min_u32(QUERY_TILE, INPUT_SEQ_LEN - query_start);
         uint32_t tile_elems = query_rows * MODEL_DIM;
@@ -637,7 +644,7 @@ static void run_model(q7_t *buffer_a, q7_t *buffer_b, q7_t *output)
     q7_t *current = buffer_a;
     q7_t *next = buffer_b;
 
-    /* Run the three stacked attention blocks in sequence, swapping the two sequence buffers. */
+    /* Run the stacked transformer blocks in sequence, swapping the two sequence buffers each layer. */
     for (uint32_t layer_idx = 0; layer_idx < NUM_LAYERS; ++layer_idx) {
         run_transformer_layer(current, next, &g_model_layers[layer_idx]);
 

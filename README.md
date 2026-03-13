@@ -1,21 +1,95 @@
-# Int8 Tiled Attention Demo
+# M55 MVE SDPA / FA2 Reference
 
-This project is a small, self-contained reference for a 3-layer int8 attention stack over a fixed `1200 x 24` input sequence. The implementation keeps two full `1200 x 24` sequence buffers live, plus one full-sequence `K` cache and one full-sequence `V` cache for the active head. Attention is still evaluated in query/key tiles, so there is no full attention-score tensor in memory.
+This repo is a small, self-contained reference for low-memory int8 scaled dot-product attention on Cortex-M55 with Helium/MVE and CMSIS-DSP. The code is intentionally written as one straight-through C program in `src/main.c`: fixed sizes, fixed buffers, imperative control flow, and comments at the points where the dataflow or fixed-point math is not obvious.
 
-The current layout is:
+The current target model is:
 
-- `1200 x 24` input sequence
-- `3` transformer-style blocks
-- attention widened internally to `32`
-- `2` heads, `16` channels per head
-- `24 -> 32 -> 24` attention path and `24 -> 24 -> 24` feed-forward per block
-- RoPE applied to `Q` and `K` with a baked q15 sin/cos table
-- `30` query rows per tile and `150` key rows per tile, so `1200` divides cleanly
-- direct `1200 x 4` classifier output with no pooling stage
+- input: `1200 x 24`
+- output: `1200 x 4`
+- blocks: `3`
+- external model width: `24`
+- internal attention width: `32`
+- heads: `2`
+- head width: `16`
+- attention path per block: `24 -> 32 -> 24`
+- feed-forward path per block: `24 -> 24 -> 24`
+- position encoding: RoPE on `Q` and `K` with baked q15 sin/cos tables
+- tile sizes: `QUERY_TILE=30`, `KEY_TILE=150`
 
-CMSIS-DSP is consumed from the adjacent `../CMSIS-DSP` checkout. The projection GEMMs use `arm_mat_mult_q7`, the residual and bias paths use q7 vector primitives, and the score path uses `arm_dot_prod_q7` now that each head is `16` lanes wide. The runtime-saving trick is that each head's full `K` and `V` sequences are materialized once, reused across all query tiles, and then discarded before moving to the next head. Each head's context tile is projected through its own `W_o` slice immediately, so there is no full `1200 x 32` attention buffer either.
+This is full attention, not local attention and not architectural chunking. Every query position still attends to every key position. The tiling is only there to control memory traffic and keep scratch small.
 
-`tools/torch_reference.py` is a PyTorch reference that mirrors the fixed-point edge path, including q7 GEMM semantics, the q15 RoPE table, and the q12 LUT softmax. It intentionally does not use `torch.sdpa`, because standard SDPA is not bit-equivalent to the edge implementation.
+## Repo Layout
+
+- `src/main.c`: the edge-oriented C reference with CMSIS-DSP and MVE hot paths
+- `tools/gen_model_data.py`: deterministic int8 parameter generator plus q12 softmax LUT and q15 RoPE table generator
+- `tools/torch_reference.py`: PyTorch mirror of the fixed-point edge path
+- `cmake/toolchains/arm-none-eabi-gcc.cmake`: Cortex-M55 cross-build setup
+
+## Shapes And Dataflow
+
+Each transformer block runs in two phases:
+
+1. Per head:
+   project `Q`, `K`, `V`
+   apply RoPE to `Q` and `K`
+   compute tiled score blocks `Q_tile @ K_tile^T`
+   run streamed online softmax over each score tile
+   accumulate weighted `V`
+   project the head context through that head's `W_o` slice and add it into the shared `24`-wide output buffer
+
+2. Per tile:
+   add output bias
+   add the residual
+   run the `24 -> 24 -> 24` feed-forward block
+   write the final tile back to the spare sequence buffer
+
+After the last block, the model applies one direct `24 -> 4` classifier row by row.
+
+## Memory Strategy
+
+The code is designed around peak-memory control rather than maximum host speed.
+
+The important tricks are:
+
+- only two full `1200 x 24` sequence buffers are live at once
+- only one head's full `K` cache and one head's full `V` cache are materialized at a time
+- there is no full `Q`, `K`, `V`, attention-score, or probability tensor for the whole sequence
+- each head context tile is projected through its `W_o` slice immediately, so there is no full `1200 x 32` attention output buffer
+- score tiles are stored as compact `int16` scratch and consumed immediately by the online softmax/value pass
+
+With the current default tiles, the score scratch is `30 x 150 x int16`, about `9 KB`.
+
+## CMSIS-DSP And MVE Use
+
+CMSIS-DSP is taken from the adjacent `../CMSIS-DSP` checkout.
+
+The split is:
+
+- CMSIS-DSP q7 GEMMs for projections and classifier via `arm_mat_mult_q7`
+- CMSIS-DSP q7 vector primitives for residual, bias, clip, fill, and copy
+- custom MVE intrinsics for the attention-specific hot path where CMSIS-DSP has no direct primitive
+
+The custom MVE pieces in `src/main.c` now include:
+
+- score microkernel for tiled `Q @ K^T`
+- weighted-`V` accumulation
+- q12 accumulator rescale
+- q15 RoPE rotation
+- sign-aware normalization setup before the final scalar divide
+
+The final divide in normalization is still scalar because MVE does not provide vector integer divide.
+
+## Exactness
+
+`tools/torch_reference.py` mirrors the fixed-point edge path instead of using `torch.sdpa`. That is intentional: standard SDPA is not bit-equivalent to this implementation because this repo uses:
+
+- q7 GEMM semantics
+- q15 RoPE tables
+- q12 LUT-based softmax decay
+- online renormalized softmax accumulation
+- saturating q7 residual and output paths
+
+The PyTorch script is there to preserve semantic equivalence with the edge path, not to imitate a standard float attention implementation.
 
 ## Build
 
@@ -38,4 +112,4 @@ cmake --build build-qemu -j4
 cmake --build build-qemu --target run_qemu
 ```
 
-For the full `1200`-token shape under QEMU, omit `-DMODEL_INPUT_SEQ_LEN=128`. That is useful for correctness, but it is much slower than the smoke profile.
+For the full `1200`-token shape under QEMU, omit `-DMODEL_INPUT_SEQ_LEN=128`. QEMU is useful for correctness and smoke testing, not for meaningful M55 timing.
