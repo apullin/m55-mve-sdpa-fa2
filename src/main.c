@@ -200,12 +200,74 @@ static void relu_q7_inplace(q7_t *data, uint32_t count)
     arm_clip_q7(data, data, 0, 127, count);
 }
 
+static void normalize_row_acc_to_q7(const int32_t *row_acc, int32_t row_sum, q7_t *dst)
+{
+    if (row_sum == 0) {
+        arm_fill_q7(0, dst, HEAD_DIM);
+        return;
+    }
+
+#if defined(ARM_MATH_MVEI) && !defined(ARM_MATH_AUTOVECTORIZE) && (HEAD_DIM == 16)
+    q31x4_t half = vdupq_n_s32(row_sum / 2);
+
+    for (uint32_t chunk = 0; chunk < HEAD_DIM; chunk += 4) {
+        q31x4_t numer = vld1q(row_acc + chunk);
+        q31x4_t pos = vaddq(numer, half);
+        q31x4_t neg = vsubq(numer, half);
+        q31x4_t adjusted = vpselq(pos, neg, vcmpgeq_n_s32(numer, 0));
+
+        for (uint32_t lane = 0; lane < 4; ++lane) {
+            dst[chunk + lane] = sat_q7(vgetq_lane_s32(adjusted, lane) / row_sum);
+        }
+    }
+#else
+    for (uint32_t d = 0; d < HEAD_DIM; ++d) {
+        int32_t numerator = row_acc[d];
+        int32_t rounded = (numerator >= 0)
+            ? (numerator + row_sum / 2) / row_sum
+            : (numerator - row_sum / 2) / row_sum;
+
+        dst[d] = sat_q7(rounded);
+    }
+#endif
+}
+
 static void apply_rope_q7_inplace(q7_t *data, uint32_t rows, uint32_t start_pos)
 {
+#if defined(ARM_MATH_MVEI) && !defined(ARM_MATH_AUTOVECTORIZE) && (HEAD_DIM == 16)
+    static const uint32_t k_even_offsets[4] = { 0U, 2U, 4U, 6U };
+    static const uint32_t k_odd_offsets[4] = { 1U, 3U, 5U, 7U };
+    uint32x4_t even_offsets = vld1q(k_even_offsets);
+    uint32x4_t odd_offsets = vld1q(k_odd_offsets);
+    q31x4_t round_q15 = vdupq_n_s32(1 << (ROPE_Q15_SHIFT - 1));
+#endif
+
     for (uint32_t row = 0; row < rows; ++row) {
         q7_t *row_ptr = data + row * HEAD_DIM;
         uint32_t pos = start_pos + row;
 
+#if defined(ARM_MATH_MVEI) && !defined(ARM_MATH_AUTOVECTORIZE) && (HEAD_DIM == 16)
+        const q15_t *cos_ptr = &g_rope_cos_q15[pos][0];
+        const q15_t *sin_ptr = &g_rope_sin_q15[pos][0];
+
+        for (uint32_t pair = 0; pair < ROPE_PAIR_DIM; pair += 4) {
+            const int8_t *pair_ptr = (const int8_t *)(row_ptr + 2U * pair);
+            q31x4_t x0 = vldrbq_gather_offset_s32(pair_ptr, even_offsets);
+            q31x4_t x1 = vldrbq_gather_offset_s32(pair_ptr, odd_offsets);
+            q31x4_t cos_q15 = vldrhq_s32(cos_ptr + pair);
+            q31x4_t sin_q15 = vldrhq_s32(sin_ptr + pair);
+            q31x4_t y0 = vsubq(vmulq(x0, cos_q15), vmulq(x1, sin_q15));
+            q31x4_t y1 = vaddq(vmulq(x0, sin_q15), vmulq(x1, cos_q15));
+
+            y0 = vshrq(vaddq(y0, round_q15), ROPE_Q15_SHIFT);
+            y1 = vshrq(vaddq(y1, round_q15), ROPE_Q15_SHIFT);
+
+            for (uint32_t lane = 0; lane < 4; ++lane) {
+                row_ptr[2U * (pair + lane)] = sat_q7(vgetq_lane_s32(y0, lane));
+                row_ptr[2U * (pair + lane) + 1U] = sat_q7(vgetq_lane_s32(y1, lane));
+            }
+        }
+#else
         for (uint32_t pair = 0; pair < ROPE_PAIR_DIM; ++pair) {
             int32_t x0 = row_ptr[2U * pair];
             int32_t x1 = row_ptr[2U * pair + 1U];
@@ -217,6 +279,7 @@ static void apply_rope_q7_inplace(q7_t *data, uint32_t rows, uint32_t start_pos)
             row_ptr[2U * pair] = sat_q7(y0);
             row_ptr[2U * pair + 1U] = sat_q7(y1);
         }
+#endif
     }
 }
 
@@ -309,16 +372,11 @@ static void run_attention_head_block_with_cache(
     }
 
     for (uint32_t q = 0; q < query_rows; ++q) {
-        for (uint32_t d = 0; d < HEAD_DIM; ++d) {
-            int32_t numerator = g_row_acc[q * HEAD_DIM + d];
-            int32_t denominator = g_row_sum[q];
-            int32_t rounded = (denominator == 0) ? 0 : (numerator >= 0
-                ? (numerator + denominator / 2) / denominator
-                : (numerator - denominator / 2) / denominator);
-
-            /* Store this head's normalized context into a compact 16-wide tile scratch. */
-            head_context_tile[q * HEAD_DIM + d] = sat_q7(rounded);
-        }
+        /* Store this head's normalized context into a compact 16-wide tile scratch. */
+        normalize_row_acc_to_q7(
+            &g_row_acc[q * HEAD_DIM],
+            g_row_sum[q],
+            &head_context_tile[q * HEAD_DIM]);
     }
 }
 
