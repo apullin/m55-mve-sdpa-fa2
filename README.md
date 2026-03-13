@@ -131,3 +131,30 @@ cmake --build build-qemu --target run_qemu
 ```
 
 For the full `1200`-token shape under QEMU, omit `-DMODEL_INPUT_SEQ_LEN=128`. QEMU is useful for correctness and smoke testing, not for meaningful M55 timing.
+
+## Cycle Profiling
+
+For real M55 bring-up, the repo can optionally instrument the main phases with the DWT cycle counter.
+
+Enable it in the Cortex-M55 build with:
+
+```sh
+cmake -S . -B build-m55-prof \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/arm-none-eabi-gcc.cmake \
+  -DARM_M55_QEMU=ON \
+  -DARM_PROFILE_CYCLES=ON
+cmake --build build-m55-prof -j4
+```
+
+When `ARM_PROFILE_CYCLES=ON` is enabled on an M55 build:
+
+- `g_cycle_profile` in `src/main.c` is populated so a debugger can inspect it after inference
+- the program prints a short summary after the checksum
+- the stats are broken down into:
+  - full model cycles
+  - input fill
+  - classifier
+  - per-layer total and FFN cycles
+  - per-head KV-cache, Q-projection/RoPE, score-tile, softmax/value-fold, normalization, and output-projection cycles
+
+This is intended for real hardware measurement. QEMU may compile and run the profiling code, but its counters are not meaningful for M55 performance.

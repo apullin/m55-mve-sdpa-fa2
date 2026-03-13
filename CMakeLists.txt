@@ -8,6 +8,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 option(ARM_M55_MVE "Enable CMSIS-DSP Helium options for Cortex-M55 builds" OFF)
 option(ARM_M55_QEMU "Build a bare-metal Cortex-M55 binary for QEMU mps3-an547" OFF)
+option(ARM_PROFILE_CYCLES "Enable DWT cycle profiling on Cortex-M55 builds" OFF)
 set(ARM_FLOAT_ABI "hard" CACHE STRING "Floating-point ABI for Cortex-M55 cross builds (softfp or hard)")
 
 set(MODEL_DIM 24 CACHE STRING "Model feature dimension")
@@ -141,6 +142,9 @@ if(ARM_M55_QEMU)
   )
 
   target_compile_definitions(tiled_attention PRIVATE ARMCM55 _GNU_SOURCE ARM_MATH_LOOPUNROLL)
+  if(ARM_PROFILE_CYCLES)
+    target_compile_definitions(tiled_attention PRIVATE TILED_ATTENTION_PROFILE_CYCLES)
+  endif()
   target_compile_options(
     tiled_attention
     PRIVATE
