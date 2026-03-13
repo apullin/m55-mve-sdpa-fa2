@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #include "arm_math.h"
 #include "model_data.h"
@@ -23,6 +24,7 @@ static q7_t ALIGN_16 g_head_v_cache[INPUT_SEQ_LEN * HEAD_DIM];
 static q7_t ALIGN_16 g_query_tile[QUERY_TILE * HEAD_DIM];
 static q7_t ALIGN_16 g_head_context_tile[QUERY_TILE * HEAD_DIM];
 static q7_t ALIGN_16 g_context_tile[QUERY_TILE * MODEL_DIM];
+static q7_t ALIGN_16 g_norm_tile[QUERY_TILE * MODEL_DIM];
 static q7_t ALIGN_16 g_work_tile[QUERY_TILE * MODEL_DIM];
 static q7_t ALIGN_16 g_residual_tile[QUERY_TILE * MODEL_DIM];
 static q7_t ALIGN_16 g_classifier_tile[QUERY_TILE * NUM_CLASSES];
@@ -204,6 +206,11 @@ static q7_t sat_q7(int32_t value)
     return (q7_t)value;
 }
 
+static int32_t round_float_to_i32(float value)
+{
+    return (value >= 0.0f) ? (int32_t)(value + 0.5f) : (int32_t)(value - 0.5f);
+}
+
 static uint32_t min_u32(uint32_t a, uint32_t b)
 {
     return (a < b) ? a : b;
@@ -276,6 +283,34 @@ static void add_bias_rows(q7_t *block, uint16_t rows, uint16_t cols, const q7_t 
             bias,
             block + row * cols,
             cols);
+    }
+}
+
+static void rmsnorm_q7_block(
+    const q7_t *input_block,
+    uint16_t rows,
+    uint16_t cols,
+    const int16_t *weight_q14,
+    q7_t *output_block)
+{
+    for (uint32_t row = 0; row < rows; ++row) {
+        const q7_t *input_row = input_block + row * cols;
+        q7_t *output_row = output_block + row * cols;
+        q31_t sum_sq = 0;
+
+        /* Pre-RMSNorm: keep the reduction cheap with q7 dot, then do the sqrt/scale in float. */
+        arm_dot_prod_q7(input_row, input_row, cols, &sum_sq);
+
+        {
+            float mean_sq = (float)sum_sq / (float)cols;
+            float inv_rms = 1.0f / sqrtf(mean_sq + 1.0e-5f);
+
+            for (uint32_t col = 0; col < cols; ++col) {
+                float gamma = (float)weight_q14[col] / (float)RMS_NORM_WEIGHT_ONE;
+                float normalized = (float)input_row[col] * inv_rms * gamma;
+                output_row[col] = sat_q7(round_float_to_i32(normalized));
+            }
+        }
     }
 }
 
@@ -632,9 +667,17 @@ static void run_attention_head_block_with_cache(
 {
     cycle_span_begin(&g_cycle_profile.head_q_proj[layer_idx][head_idx]);
 
+    /* Pre-norm the query tile before the attention projections. */
+    rmsnorm_q7_block(
+        input_sequence + query_start * MODEL_DIM,
+        (uint16_t)query_rows,
+        MODEL_DIM,
+        layer->rms_attn_w_q14,
+        g_norm_tile);
+
     /* Project just the active query tile for this head. */
     q7_linear_block(
-        input_sequence + query_start * MODEL_DIM,
+        g_norm_tile,
         (uint16_t)query_rows,
         MODEL_DIM,
         &layer->w_q[head_idx][0][0],
@@ -720,28 +763,40 @@ static void run_attention_head_block_with_cache(
 
 static void build_head_kv_cache(const q7_t *input_sequence, const model_layer_t *layer, uint32_t head_idx)
 {
-    /* Materialize this head's full K sequence once so all query tiles can reuse it. */
-    q7_linear_block(
-        input_sequence,
-        INPUT_SEQ_LEN,
-        MODEL_DIM,
-        &layer->w_k[head_idx][0][0],
-        HEAD_DIM,
-        NULL,
-        g_head_k_cache);
+    for (uint32_t tile_start = 0; tile_start < INPUT_SEQ_LEN; tile_start += QUERY_TILE) {
+        uint32_t tile_rows = min_u32(QUERY_TILE, INPUT_SEQ_LEN - tile_start);
+
+        /* Pre-norm one sequence tile and reuse it for both K and V projections. */
+        rmsnorm_q7_block(
+            input_sequence + tile_start * MODEL_DIM,
+            (uint16_t)tile_rows,
+            MODEL_DIM,
+            layer->rms_attn_w_q14,
+            g_norm_tile);
+
+        /* Materialize this head's full K sequence once so all query tiles can reuse it. */
+        q7_linear_block(
+            g_norm_tile,
+            (uint16_t)tile_rows,
+            MODEL_DIM,
+            &layer->w_k[head_idx][0][0],
+            HEAD_DIM,
+            NULL,
+            g_head_k_cache + tile_start * HEAD_DIM);
+
+        /* Materialize this head's full V sequence once for the same reason. */
+        q7_linear_block(
+            g_norm_tile,
+            (uint16_t)tile_rows,
+            MODEL_DIM,
+            &layer->w_v[head_idx][0][0],
+            HEAD_DIM,
+            NULL,
+            g_head_v_cache + tile_start * HEAD_DIM);
+    }
 
     /* Apply RoPE once to the cached K rows so all query tiles reuse the rotated keys. */
     apply_rope_q7_inplace(g_head_k_cache, INPUT_SEQ_LEN, 0U);
-
-    /* Materialize this head's full V sequence once for the same reason. */
-    q7_linear_block(
-        input_sequence,
-        INPUT_SEQ_LEN,
-        MODEL_DIM,
-        &layer->w_v[head_idx][0][0],
-        HEAD_DIM,
-        NULL,
-        g_head_v_cache);
 }
 
 static void run_transformer_layer(
@@ -813,9 +868,17 @@ static void run_transformer_layer(
             g_residual_tile,
             tile_elems);
 
-        /* Apply the first 24->24 feed-forward projection on the residual tile. */
-        q7_linear_block(
+        /* Pre-norm the residual tile before the feed-forward block. */
+        rmsnorm_q7_block(
             g_residual_tile,
+            (uint16_t)query_rows,
+            MODEL_DIM,
+            layer->rms_ffn_w_q14,
+            g_norm_tile);
+
+        /* Apply the first 24->24 feed-forward projection on the normalized residual tile. */
+        q7_linear_block(
+            g_norm_tile,
             (uint16_t)query_rows,
             MODEL_DIM,
             &layer->w_ff1[0][0],

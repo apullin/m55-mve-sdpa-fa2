@@ -16,6 +16,8 @@ SOFTMAX_STEP = 0.25
 ROPE_Q15_SHIFT = 15
 ROPE_Q15_ONE = 1 << ROPE_Q15_SHIFT
 ROPE_BASE = 10000.0
+RMS_NORM_WEIGHT_SHIFT = 14
+RMS_NORM_WEIGHT_ONE = 1 << RMS_NORM_WEIGHT_SHIFT
 
 
 class XorShift32:
@@ -61,15 +63,25 @@ def make_tensor(rng: XorShift32, shape: tuple[int, ...], magnitude: int, zero_ma
     return [make_tensor(rng, shape[1:], magnitude, zero_mask) for _ in range(shape[0])]
 
 
+def make_rms_weight_q14(rng: XorShift32, length: int, spread: int = 2048) -> list[int]:
+    weights = []
+    for _ in range(length):
+        delta = int(rng.next_u32() % (2 * spread + 1)) - spread
+        weights.append(max(-32768, min(32767, RMS_NORM_WEIGHT_ONE + delta)))
+    return weights
+
+
 def generate_layer(seed: int, model_dim: int, num_heads: int, head_dim: int) -> dict[str, list]:
     rng = XorShift32(seed)
     attn_dim = num_heads * head_dim
     return {
+        "rms_attn_w_q14": make_rms_weight_q14(rng, model_dim),
         "w_q": make_tensor(rng, (num_heads, model_dim, head_dim), magnitude=6, zero_mask=0x3),
         "w_k": make_tensor(rng, (num_heads, model_dim, head_dim), magnitude=6, zero_mask=0x3),
         "w_v": make_tensor(rng, (num_heads, model_dim, head_dim), magnitude=7, zero_mask=0x7),
         "w_o": make_tensor(rng, (attn_dim, model_dim), magnitude=8, zero_mask=0x7),
         "b_o": make_tensor(rng, (model_dim,), magnitude=2, zero_mask=0x1),
+        "rms_ffn_w_q14": make_rms_weight_q14(rng, model_dim),
         "w_ff1": make_tensor(rng, (model_dim, model_dim), magnitude=9, zero_mask=0x7),
         "b_ff1": make_tensor(rng, (model_dim,), magnitude=2, zero_mask=0x1),
         "w_ff2": make_tensor(rng, (model_dim, model_dim), magnitude=8, zero_mask=0x7),
@@ -80,7 +92,7 @@ def generate_layer(seed: int, model_dim: int, num_heads: int, head_dim: int) -> 
 def render_layer_initializer(layer: dict[str, list], indent: int = 8) -> str:
     pad = " " * indent
     parts = []
-    for key in ("w_q", "w_k", "w_v", "w_o", "b_o", "w_ff1", "b_ff1", "w_ff2", "b_ff2"):
+    for key in ("rms_attn_w_q14", "w_q", "w_k", "w_v", "w_o", "b_o", "rms_ffn_w_q14", "w_ff1", "b_ff1", "w_ff2", "b_ff2"):
         parts.append(f"{pad}.{key} = {c_format(layer[key], indent)},")
     return "\n".join(parts)
 
@@ -162,15 +174,19 @@ def render_header(
 #define SOFTMAX_LUT_SIZE {SOFTMAX_LUT_SIZE}
 #define ATTN_SCORE_SHIFT {ATTN_SCORE_SHIFT}
 #define ROPE_Q15_SHIFT {ROPE_Q15_SHIFT}
+#define RMS_NORM_WEIGHT_SHIFT {RMS_NORM_WEIGHT_SHIFT}
+#define RMS_NORM_WEIGHT_ONE {RMS_NORM_WEIGHT_ONE}
 #define ROPE_PAIR_DIM (HEAD_DIM / 2)
 
 typedef struct
 {{
+    int16_t rms_attn_w_q14[MODEL_DIM];
     q7_t w_q[NUM_HEADS][MODEL_DIM][HEAD_DIM];
     q7_t w_k[NUM_HEADS][MODEL_DIM][HEAD_DIM];
     q7_t w_v[NUM_HEADS][MODEL_DIM][HEAD_DIM];
     q7_t w_o[ATTN_DIM][MODEL_DIM];
     q7_t b_o[MODEL_DIM];
+    int16_t rms_ffn_w_q14[MODEL_DIM];
     q7_t w_ff1[MODEL_DIM][MODEL_DIM];
     q7_t b_ff1[MODEL_DIM];
     q7_t w_ff2[MODEL_DIM][MODEL_DIM];

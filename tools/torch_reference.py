@@ -3,6 +3,7 @@
 
 This intentionally mirrors the C implementation's fixed-point dataflow:
 - q7 GEMM semantics for the linear layers
+- q14 RMSNorm weights with float RMS evaluation and q7 requantization
 - q15 RoPE tables
 - streamed online softmax with the same q12 LUT
 - q7 residual / bias saturation
@@ -10,6 +11,9 @@ This intentionally mirrors the C implementation's fixed-point dataflow:
 It does not use torch.sdpa. Standard SDPA is useful for training, but it is not
 bit-equivalent to the edge implementation because the edge path uses fixed-point
 projections, a LUT softmax, and online renormalization.
+
+The default CLI runs in eval mode for exact parity. The module also exposes a
+Python-only dropout knob for training-side experiments.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from typing import Iterable
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 import gen_model_data as modelgen
 
@@ -35,6 +40,7 @@ class ModelConfig:
     num_classes: int = 4
     query_tile: int = 30
     key_tile: int = 150
+    dropout_p: float = 0.0
 
     @property
     def head_dim(self) -> int:
@@ -67,6 +73,12 @@ def as_int_tensor(data: object) -> torch.Tensor:
     return torch.tensor(data, dtype=torch.int32)
 
 
+def symmetric_round_float(x: torch.Tensor) -> torch.Tensor:
+    pos = torch.trunc(x + 0.5)
+    neg = torch.trunc(x - 0.5)
+    return torch.where(x >= 0, pos, neg).to(torch.int32)
+
+
 def build_demo_input(cfg: ModelConfig) -> torch.Tensor:
     sequence = torch.empty((cfg.input_seq_len, cfg.model_dim), dtype=torch.int32)
     rng = XorShift32(0x1A2B3C4D)
@@ -84,11 +96,13 @@ def build_demo_input(cfg: ModelConfig) -> torch.Tensor:
 class ReferenceLayer(nn.Module):
     def __init__(self, layer_data: dict[str, list]) -> None:
         super().__init__()
+        self.register_buffer("rms_attn_w_q14", as_int_tensor(layer_data["rms_attn_w_q14"]))
         self.register_buffer("w_q", as_int_tensor(layer_data["w_q"]))
         self.register_buffer("w_k", as_int_tensor(layer_data["w_k"]))
         self.register_buffer("w_v", as_int_tensor(layer_data["w_v"]))
         self.register_buffer("w_o", as_int_tensor(layer_data["w_o"]))
         self.register_buffer("b_o", as_int_tensor(layer_data["b_o"]))
+        self.register_buffer("rms_ffn_w_q14", as_int_tensor(layer_data["rms_ffn_w_q14"]))
         self.register_buffer("w_ff1", as_int_tensor(layer_data["w_ff1"]))
         self.register_buffer("b_ff1", as_int_tensor(layer_data["b_ff1"]))
         self.register_buffer("w_ff2", as_int_tensor(layer_data["w_ff2"]))
@@ -131,6 +145,21 @@ class EdgeReferenceModel(nn.Module):
             return out
         return add_q7(out, bias.view(1, -1).expand_as(out))
 
+    def rmsnorm_q7_block(self, input_block: torch.Tensor, weight_q14: torch.Tensor) -> torch.Tensor:
+        x = input_block.to(torch.float32)
+        mean_sq = (x * x).mean(dim=1, keepdim=True)
+        inv_rms = torch.reciprocal(torch.sqrt(mean_sq + 1.0e-5))
+        gamma = weight_q14.to(torch.float32).view(1, -1) / float(modelgen.RMS_NORM_WEIGHT_ONE)
+        normalized = x * inv_rms * gamma
+        return sat_q7(symmetric_round_float(normalized))
+
+    def maybe_dropout_q7(self, block: torch.Tensor) -> torch.Tensor:
+        if (not self.training) or (self.cfg.dropout_p <= 0.0):
+            return block
+
+        dropped = F.dropout(block.to(torch.float32), p=self.cfg.dropout_p, training=True)
+        return sat_q7(symmetric_round_float(dropped))
+
     def apply_rope_q7(self, data: torch.Tensor, start_pos: int) -> torch.Tensor:
         rows = data.shape[0]
         pair_dim = self.cfg.head_dim // 2
@@ -162,9 +191,10 @@ class EdgeReferenceModel(nn.Module):
         return out
 
     def build_head_kv_cache(self, sequence: torch.Tensor, layer: ReferenceLayer, head_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        k_cache = self.q7_linear_block(sequence, layer.w_k[head_idx], None)
+        normed = self.rmsnorm_q7_block(sequence, layer.rms_attn_w_q14)
+        k_cache = self.q7_linear_block(normed, layer.w_k[head_idx], None)
         k_cache = self.apply_rope_q7(k_cache, 0)
-        v_cache = self.q7_linear_block(sequence, layer.w_v[head_idx], None)
+        v_cache = self.q7_linear_block(normed, layer.w_v[head_idx], None)
         return k_cache, v_cache
 
     def run_attention_head_block_with_cache(
@@ -177,9 +207,10 @@ class EdgeReferenceModel(nn.Module):
         head_k_cache: torch.Tensor,
         head_v_cache: torch.Tensor,
     ) -> torch.Tensor:
-        query_tile = self.q7_linear_block(
-            sequence[query_start : query_start + query_rows], layer.w_q[head_idx], None
+        normed_query = self.rmsnorm_q7_block(
+            sequence[query_start : query_start + query_rows], layer.rms_attn_w_q14
         )
+        query_tile = self.q7_linear_block(normed_query, layer.w_q[head_idx], None)
         query_tile = self.apply_rope_q7(query_tile, query_start)
 
         row_max = torch.full((query_rows,), -(1 << 15), dtype=torch.int32)
@@ -253,6 +284,7 @@ class EdgeReferenceModel(nn.Module):
                     layer.w_o[head_idx * self.cfg.head_dim : (head_idx + 1) * self.cfg.head_dim],
                     None,
                 )
+                projected = self.maybe_dropout_q7(projected)
                 next_sequence[query_start : query_start + query_rows] = add_q7(
                     next_sequence[query_start : query_start + query_rows], projected
                 )
@@ -264,9 +296,11 @@ class EdgeReferenceModel(nn.Module):
                 layer.b_o.view(1, -1).expand(query_rows, -1),
             )
             residual = add_q7(current_sequence[query_start : query_start + query_rows], attention_out)
-            work = self.q7_linear_block(residual, layer.w_ff1, layer.b_ff1)
+            normed_residual = self.rmsnorm_q7_block(residual, layer.rms_ffn_w_q14)
+            work = self.q7_linear_block(normed_residual, layer.w_ff1, layer.b_ff1)
             work = work.clamp(0, 127)
             context = self.q7_linear_block(work, layer.w_ff2, layer.b_ff2)
+            context = self.maybe_dropout_q7(context)
             next_sequence[query_start : query_start + query_rows] = add_q7(residual, context)
 
         return next_sequence
@@ -300,14 +334,16 @@ def checksum_q7(data: torch.Tensor) -> int:
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-seq-len", type=int, default=128, help="Sequence length for the demo run")
+    parser.add_argument("--dropout-p", type=float, default=0.0, help="Training-only dropout probability for the Python path")
     parser.add_argument("--dump-output", type=Path, default=None, help="Optional path to write raw q7 output bytes")
     return parser.parse_args(argv)
 
 
 def main(argv: Iterable[str] | None = None) -> int:
     args = parse_args(argv)
-    cfg = ModelConfig(input_seq_len=args.input_seq_len)
+    cfg = ModelConfig(input_seq_len=args.input_seq_len, dropout_p=args.dropout_p)
     model = EdgeReferenceModel(cfg)
+    model.eval()
     sequence = build_demo_input(cfg)
     output = model(sequence)
 

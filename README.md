@@ -13,6 +13,7 @@ The current target model is:
 - head width: `16`
 - attention path per block: `24 -> 32 -> 24`
 - feed-forward path per block: `24 -> 24 -> 24`
+- normalization: pre-RMSNorm before attention and before FFN
 - position encoding: RoPE on `Q` and `K` with baked q15 sin/cos tables
 - tile sizes: `QUERY_TILE=30`, `KEY_TILE=150`
 
@@ -30,6 +31,7 @@ This is full attention, not local attention and not architectural chunking. Ever
 Each transformer block runs in two phases:
 
 1. Per head:
+   apply pre-RMSNorm to the active input rows
    project `Q`, `K`, `V`
    apply RoPE to `Q` and `K`
    compute tiled score blocks `Q_tile @ K_tile^T`
@@ -40,6 +42,7 @@ Each transformer block runs in two phases:
 2. Per tile:
    add output bias
    add the residual
+   apply pre-RMSNorm to the residual
    run the `24 -> 24 -> 24` feed-forward block
    write the final tile back to the spare sequence buffer
 
@@ -53,6 +56,7 @@ The important tricks are:
 
 - only two full `1200 x 24` sequence buffers are live at once
 - only one head's full `K` cache and one head's full `V` cache are materialized at a time
+- RMSNorm is applied tile-by-tile, so there is no extra full-sequence normalized buffer
 - there is no full `Q`, `K`, `V`, attention-score, or probability tensor for the whole sequence
 - each head context tile is projected through its `W_o` slice immediately, so there is no full `1200 x 32` attention output buffer
 - score tiles are stored as compact `int16` scratch and consumed immediately by the online softmax/value pass
@@ -84,12 +88,13 @@ The final divide in normalization is still scalar because MVE does not provide v
 `tools/torch_reference.py` mirrors the fixed-point edge path instead of using `torch.sdpa`. That is intentional: standard SDPA is not bit-equivalent to this implementation because this repo uses:
 
 - q7 GEMM semantics
+- q14 RMSNorm weights with float RMS evaluation and q7 requantization
 - q15 RoPE tables
 - q12 LUT-based softmax decay
 - online renormalized softmax accumulation
 - saturating q7 residual and output paths
 
-The PyTorch script is there to preserve semantic equivalence with the edge path, not to imitate a standard float attention implementation.
+The PyTorch script is there to preserve semantic equivalence with the edge path, not to imitate a standard float attention implementation. It also exposes a Python-only dropout knob for experimentation, but the default parity path keeps dropout disabled.
 
 ## Parity Test
 
