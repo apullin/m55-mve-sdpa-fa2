@@ -57,6 +57,7 @@ The code is designed around peak-memory control rather than maximum host speed.
 
 The important tricks are:
 
+- the full working set now lives in one runtime context allocation, so firmware can reserve it only for the duration of inference
 - only two full `1200 x 24` sequence buffers are live at once
 - only one head's full `K` cache and one head's full `V` cache are materialized at a time
 - RMSNorm is applied tile-by-tile, so there is no extra full-sequence normalized buffer
@@ -139,6 +140,8 @@ cmake --build build-qemu --target run_qemu
 ```
 
 For the full `1200`-token shape under QEMU, omit `-DMODEL_INPUT_SEQ_LEN=128`. QEMU is useful for correctness and smoke testing, not for meaningful M55 timing.
+
+The bare-metal QEMU linker script reserves heap for that one-shot context allocation, matching the intended on-device lifetime model.
 
 ## Cycle Profiling
 

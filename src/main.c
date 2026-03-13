@@ -13,29 +13,6 @@
 
 #define ALIGN_16 __attribute__((aligned(16)))
 
-/* Two full sequence buffers are the main working set that get swapped layer by layer. */
-static q7_t ALIGN_16 g_hidden_a[INPUT_SEQ_LEN * MODEL_DIM];
-static q7_t ALIGN_16 g_hidden_b[INPUT_SEQ_LEN * MODEL_DIM];
-static q7_t ALIGN_16 g_output[OUTPUT_SEQ_LEN * NUM_CLASSES];
-
-/* Per-head caches and per-tile scratch keep the attention path streaming and low-memory. */
-static q7_t ALIGN_16 g_head_k_cache[INPUT_SEQ_LEN * HEAD_DIM];
-static q7_t ALIGN_16 g_head_v_cache[INPUT_SEQ_LEN * HEAD_DIM];
-static q7_t ALIGN_16 g_query_tile[QUERY_TILE * HEAD_DIM];
-static q7_t ALIGN_16 g_head_context_tile[QUERY_TILE * HEAD_DIM];
-static q7_t ALIGN_16 g_context_tile[QUERY_TILE * MODEL_DIM];
-static q7_t ALIGN_16 g_norm_tile[QUERY_TILE * MODEL_DIM];
-static q7_t ALIGN_16 g_work_tile[QUERY_TILE * FFN_DIM];
-static q7_t ALIGN_16 g_residual_tile[QUERY_TILE * MODEL_DIM];
-static q7_t ALIGN_16 g_classifier_tile[QUERY_TILE * NUM_CLASSES];
-static q7_t ALIGN_16 g_matmul_state[MODEL_DIM * (((FFN_DIM > HEAD_DIM) ? FFN_DIM : HEAD_DIM) > MODEL_DIM
-    ? ((FFN_DIM > HEAD_DIM) ? FFN_DIM : HEAD_DIM)
-    : MODEL_DIM)];
-static int16_t ALIGN_16 g_score_tile[QUERY_TILE * KEY_TILE];
-static int16_t ALIGN_16 g_row_max[QUERY_TILE];
-static int32_t ALIGN_16 g_row_sum[QUERY_TILE];
-static int32_t ALIGN_16 g_row_acc[QUERY_TILE * HEAD_DIM];
-
 typedef struct {
     /* Repeated regions accumulate raw start/end timestamps; finalize computes end_sum - start_sum. */
     uint64_t start_sum;
@@ -58,18 +35,69 @@ typedef struct {
     cycle_span_t head_out_proj[NUM_LAYERS][NUM_HEADS];
 } model_cycle_profile_t;
 
-/* This global can be inspected under a debugger after inference, even if printing is disabled. */
-static volatile model_cycle_profile_t g_cycle_profile;
+typedef struct {
+    /* All inference-time buffers live in one context so callers can reserve/free them as one block. */
+    q7_t ALIGN_16 hidden_a[INPUT_SEQ_LEN * MODEL_DIM];
+    q7_t ALIGN_16 hidden_b[INPUT_SEQ_LEN * MODEL_DIM];
+    q7_t ALIGN_16 output[OUTPUT_SEQ_LEN * NUM_CLASSES];
 
-#if defined(TILED_ATTENTION_PROFILE_CYCLES) && defined(ARMCM55)
-static void cycle_profile_reset(void)
+    q7_t ALIGN_16 head_k_cache[INPUT_SEQ_LEN * HEAD_DIM];
+    q7_t ALIGN_16 head_v_cache[INPUT_SEQ_LEN * HEAD_DIM];
+    q7_t ALIGN_16 query_tile[QUERY_TILE * HEAD_DIM];
+    q7_t ALIGN_16 head_context_tile[QUERY_TILE * HEAD_DIM];
+    q7_t ALIGN_16 context_tile[QUERY_TILE * MODEL_DIM];
+    q7_t ALIGN_16 norm_tile[QUERY_TILE * MODEL_DIM];
+    q7_t ALIGN_16 work_tile[QUERY_TILE * FFN_DIM];
+    q7_t ALIGN_16 residual_tile[QUERY_TILE * MODEL_DIM];
+    q7_t ALIGN_16 classifier_tile[QUERY_TILE * NUM_CLASSES];
+    q7_t ALIGN_16 matmul_state[MODEL_DIM * (((FFN_DIM > HEAD_DIM) ? FFN_DIM : HEAD_DIM) > MODEL_DIM
+        ? ((FFN_DIM > HEAD_DIM) ? FFN_DIM : HEAD_DIM)
+        : MODEL_DIM)];
+    int16_t ALIGN_16 score_tile[QUERY_TILE * KEY_TILE];
+    int16_t ALIGN_16 row_max[QUERY_TILE];
+    int32_t ALIGN_16 row_sum[QUERY_TILE];
+    int32_t ALIGN_16 row_acc[QUERY_TILE * HEAD_DIM];
+
+    /* The profiler state lives alongside the buffers so debugger inspection follows the same lifetime. */
+    volatile model_cycle_profile_t cycle_profile;
+} tiled_attention_ctx_t;
+
+static tiled_attention_ctx_t *alloc_tiled_attention_ctx(void)
 {
-    memset((void *)&g_cycle_profile, 0, sizeof(g_cycle_profile));
+    uintptr_t raw_addr;
+    uintptr_t aligned_addr;
+    void *raw = malloc(sizeof(tiled_attention_ctx_t) + 15U + sizeof(void *));
+    tiled_attention_ctx_t *ctx;
+
+    if (raw == NULL) {
+        fprintf(stderr, "malloc tiled_attention_ctx_t failed\n");
+        exit(1);
+    }
+
+    raw_addr = (uintptr_t)raw + sizeof(void *);
+    aligned_addr = (raw_addr + 15U) & ~(uintptr_t)15U;
+    ctx = (tiled_attention_ctx_t *)aligned_addr;
+    ((void **)ctx)[-1] = raw;
+    memset(ctx, 0, sizeof(*ctx));
+    return ctx;
 }
 
-static void cycle_profile_init(void)
+static void free_tiled_attention_ctx(tiled_attention_ctx_t *ctx)
 {
-    cycle_profile_reset();
+    if (ctx != NULL) {
+        free(((void **)ctx)[-1]);
+    }
+}
+
+#if defined(TILED_ATTENTION_PROFILE_CYCLES) && defined(ARMCM55)
+static void cycle_profile_reset(tiled_attention_ctx_t *ctx)
+{
+    memset((void *)&ctx->cycle_profile, 0, sizeof(ctx->cycle_profile));
+}
+
+static void cycle_profile_init(tiled_attention_ctx_t *ctx)
+{
+    cycle_profile_reset(ctx);
 
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
 #if defined(DWT_LAR)
@@ -94,19 +122,19 @@ static void cycle_profile_init(void)
         }
     }
 
-    g_cycle_profile.enabled = 1U;
+    ctx->cycle_profile.enabled = 1U;
 }
 
-static void cycle_span_begin(volatile cycle_span_t *span)
+static void cycle_span_begin(tiled_attention_ctx_t *ctx, volatile cycle_span_t *span)
 {
-    if (g_cycle_profile.enabled) {
+    if (ctx->cycle_profile.enabled) {
         span->start_sum += (uint64_t)DWT->CYCCNT;
     }
 }
 
-static void cycle_span_end(volatile cycle_span_t *span)
+static void cycle_span_end(tiled_attention_ctx_t *ctx, volatile cycle_span_t *span)
 {
-    if (g_cycle_profile.enabled) {
+    if (ctx->cycle_profile.enabled) {
         span->end_sum += (uint64_t)DWT->CYCCNT;
     }
 }
@@ -116,84 +144,89 @@ static void cycle_span_finalize(volatile cycle_span_t *span)
     span->cycles = span->end_sum - span->start_sum;
 }
 
-static void cycle_profile_finalize(void)
+static void cycle_profile_finalize(tiled_attention_ctx_t *ctx)
 {
-    if (!g_cycle_profile.enabled) {
+    if (!ctx->cycle_profile.enabled) {
         return;
     }
 
-    cycle_span_finalize(&g_cycle_profile.fill_input);
-    cycle_span_finalize(&g_cycle_profile.run_model);
-    cycle_span_finalize(&g_cycle_profile.classify);
+    cycle_span_finalize(&ctx->cycle_profile.fill_input);
+    cycle_span_finalize(&ctx->cycle_profile.run_model);
+    cycle_span_finalize(&ctx->cycle_profile.classify);
 
     for (uint32_t layer_idx = 0; layer_idx < NUM_LAYERS; ++layer_idx) {
-        cycle_span_finalize(&g_cycle_profile.layer_total[layer_idx]);
-        cycle_span_finalize(&g_cycle_profile.layer_ffn[layer_idx]);
+        cycle_span_finalize(&ctx->cycle_profile.layer_total[layer_idx]);
+        cycle_span_finalize(&ctx->cycle_profile.layer_ffn[layer_idx]);
 
         for (uint32_t head_idx = 0; head_idx < NUM_HEADS; ++head_idx) {
-            cycle_span_finalize(&g_cycle_profile.head_kv_cache[layer_idx][head_idx]);
-            cycle_span_finalize(&g_cycle_profile.head_q_proj[layer_idx][head_idx]);
-            cycle_span_finalize(&g_cycle_profile.head_score[layer_idx][head_idx]);
-            cycle_span_finalize(&g_cycle_profile.head_softmax[layer_idx][head_idx]);
-            cycle_span_finalize(&g_cycle_profile.head_normalize[layer_idx][head_idx]);
-            cycle_span_finalize(&g_cycle_profile.head_out_proj[layer_idx][head_idx]);
+            cycle_span_finalize(&ctx->cycle_profile.head_kv_cache[layer_idx][head_idx]);
+            cycle_span_finalize(&ctx->cycle_profile.head_q_proj[layer_idx][head_idx]);
+            cycle_span_finalize(&ctx->cycle_profile.head_score[layer_idx][head_idx]);
+            cycle_span_finalize(&ctx->cycle_profile.head_softmax[layer_idx][head_idx]);
+            cycle_span_finalize(&ctx->cycle_profile.head_normalize[layer_idx][head_idx]);
+            cycle_span_finalize(&ctx->cycle_profile.head_out_proj[layer_idx][head_idx]);
         }
     }
 }
 
-static void print_cycle_profile_summary(void)
+static void print_cycle_profile_summary(const tiled_attention_ctx_t *ctx)
 {
-    if (!g_cycle_profile.enabled) {
+    if (!ctx->cycle_profile.enabled) {
         printf("cycle-profile: unavailable\n");
         return;
     }
 
     printf("cycle-profile: total=%llu fill=%llu classify=%llu\n",
-        (unsigned long long)g_cycle_profile.run_model.cycles,
-        (unsigned long long)g_cycle_profile.fill_input.cycles,
-        (unsigned long long)g_cycle_profile.classify.cycles);
+        (unsigned long long)ctx->cycle_profile.run_model.cycles,
+        (unsigned long long)ctx->cycle_profile.fill_input.cycles,
+        (unsigned long long)ctx->cycle_profile.classify.cycles);
 
     for (uint32_t layer_idx = 0; layer_idx < NUM_LAYERS; ++layer_idx) {
         printf("cycle-profile: layer%lu total=%llu ffn=%llu\n",
             (unsigned long)layer_idx,
-            (unsigned long long)g_cycle_profile.layer_total[layer_idx].cycles,
-            (unsigned long long)g_cycle_profile.layer_ffn[layer_idx].cycles);
+            (unsigned long long)ctx->cycle_profile.layer_total[layer_idx].cycles,
+            (unsigned long long)ctx->cycle_profile.layer_ffn[layer_idx].cycles);
 
         for (uint32_t head_idx = 0; head_idx < NUM_HEADS; ++head_idx) {
             printf(
                 "cycle-profile: layer%lu head%lu kv=%llu q=%llu score=%llu softmax=%llu norm=%llu out=%llu\n",
                 (unsigned long)layer_idx,
                 (unsigned long)head_idx,
-                (unsigned long long)g_cycle_profile.head_kv_cache[layer_idx][head_idx].cycles,
-                (unsigned long long)g_cycle_profile.head_q_proj[layer_idx][head_idx].cycles,
-                (unsigned long long)g_cycle_profile.head_score[layer_idx][head_idx].cycles,
-                (unsigned long long)g_cycle_profile.head_softmax[layer_idx][head_idx].cycles,
-                (unsigned long long)g_cycle_profile.head_normalize[layer_idx][head_idx].cycles,
-                (unsigned long long)g_cycle_profile.head_out_proj[layer_idx][head_idx].cycles);
+                (unsigned long long)ctx->cycle_profile.head_kv_cache[layer_idx][head_idx].cycles,
+                (unsigned long long)ctx->cycle_profile.head_q_proj[layer_idx][head_idx].cycles,
+                (unsigned long long)ctx->cycle_profile.head_score[layer_idx][head_idx].cycles,
+                (unsigned long long)ctx->cycle_profile.head_softmax[layer_idx][head_idx].cycles,
+                (unsigned long long)ctx->cycle_profile.head_normalize[layer_idx][head_idx].cycles,
+                (unsigned long long)ctx->cycle_profile.head_out_proj[layer_idx][head_idx].cycles);
         }
     }
 }
 #else
-static void cycle_profile_init(void)
+static void cycle_profile_init(tiled_attention_ctx_t *ctx)
 {
+    (void)ctx;
 }
 
-static void cycle_span_begin(volatile cycle_span_t *span)
+static void cycle_span_begin(tiled_attention_ctx_t *ctx, volatile cycle_span_t *span)
 {
+    (void)ctx;
     (void)span;
 }
 
-static void cycle_span_end(volatile cycle_span_t *span)
+static void cycle_span_end(tiled_attention_ctx_t *ctx, volatile cycle_span_t *span)
 {
+    (void)ctx;
     (void)span;
 }
 
-static void cycle_profile_finalize(void)
+static void cycle_profile_finalize(tiled_attention_ctx_t *ctx)
 {
+    (void)ctx;
 }
 
-static void print_cycle_profile_summary(void)
+static void print_cycle_profile_summary(const tiled_attention_ctx_t *ctx)
 {
+    (void)ctx;
 }
 #endif
 
@@ -248,6 +281,7 @@ static void check_status(arm_status status, const char *what)
 }
 
 static void q7_linear_block(
+    tiled_attention_ctx_t *ctx,
     const q7_t *input_block,
     uint16_t rows,
     uint16_t cols_in,
@@ -261,7 +295,7 @@ static void q7_linear_block(
     arm_matrix_instance_q7 c = { rows, cols_out, output_block };
 
     /* Project one contiguous tile with CMSIS-DSP's q7 matrix multiply. */
-    check_status(arm_mat_mult_q7(&a, &b, &c, g_matmul_state), "arm_mat_mult_q7");
+    check_status(arm_mat_mult_q7(&a, &b, &c, ctx->matmul_state), "arm_mat_mult_q7");
 
     if (bias == NULL) {
         return;
@@ -330,6 +364,7 @@ static int16_t dot_q7_head(const q7_t *a, const q7_t *b)
 }
 
 static void compute_score_tile_q7(
+    tiled_attention_ctx_t *ctx,
     const q7_t *query_block,
     const q7_t *key_block,
     uint32_t query_rows,
@@ -345,10 +380,10 @@ static void compute_score_tile_q7(
         q7x16_t query_vec1 = vld1q(&query_block[(q + 1U) * HEAD_DIM]);
         q7x16_t query_vec2 = vld1q(&query_block[(q + 2U) * HEAD_DIM]);
         q7x16_t query_vec3 = vld1q(&query_block[(q + 3U) * HEAD_DIM]);
-        int16_t *score_row0 = &g_score_tile[(q + 0U) * KEY_TILE];
-        int16_t *score_row1 = &g_score_tile[(q + 1U) * KEY_TILE];
-        int16_t *score_row2 = &g_score_tile[(q + 2U) * KEY_TILE];
-        int16_t *score_row3 = &g_score_tile[(q + 3U) * KEY_TILE];
+        int16_t *score_row0 = &ctx->score_tile[(q + 0U) * KEY_TILE];
+        int16_t *score_row1 = &ctx->score_tile[(q + 1U) * KEY_TILE];
+        int16_t *score_row2 = &ctx->score_tile[(q + 2U) * KEY_TILE];
+        int16_t *score_row3 = &ctx->score_tile[(q + 3U) * KEY_TILE];
         const q7_t *key_vec = key_block;
         uint32_t k = 0U;
 
@@ -411,7 +446,7 @@ static void compute_score_tile_q7(
 
     for (; q < query_rows; ++q) {
         q7x16_t query_vec = vld1q(&query_block[q * HEAD_DIM]);
-        int16_t *score_row = &g_score_tile[q * KEY_TILE];
+        int16_t *score_row = &ctx->score_tile[q * KEY_TILE];
         const q7_t *key_vec = key_block;
         uint32_t k = 0U;
 
@@ -437,7 +472,7 @@ static void compute_score_tile_q7(
 #else
     for (uint32_t q = 0; q < query_rows; ++q) {
         const q7_t *query_vec = &query_block[q * HEAD_DIM];
-        int16_t *score_row = &g_score_tile[q * KEY_TILE];
+        int16_t *score_row = &ctx->score_tile[q * KEY_TILE];
 
         for (uint32_t k = 0; k < key_rows; ++k) {
             score_row[k] = dot_q7_head(query_vec, &key_block[k * HEAD_DIM]);
@@ -659,6 +694,7 @@ static void maybe_dump_output(const q7_t *output, uint32_t count)
 #endif
 
 static void run_attention_head_block_with_cache(
+    tiled_attention_ctx_t *ctx,
     const q7_t *input_sequence,
     const model_layer_t *layer,
     uint32_t layer_idx,
@@ -667,7 +703,7 @@ static void run_attention_head_block_with_cache(
     uint32_t query_rows,
     q7_t *head_context_tile)
 {
-    cycle_span_begin(&g_cycle_profile.head_q_proj[layer_idx][head_idx]);
+    cycle_span_begin(ctx, &ctx->cycle_profile.head_q_proj[layer_idx][head_idx]);
 
     /* Pre-norm the query tile before the attention projections. */
     rmsnorm_q7_block(
@@ -675,51 +711,52 @@ static void run_attention_head_block_with_cache(
         (uint16_t)query_rows,
         MODEL_DIM,
         layer->rms_attn_w_q14,
-        g_norm_tile);
+        ctx->norm_tile);
 
     /* Project just the active query tile for this head. */
     q7_linear_block(
-        g_norm_tile,
+        ctx,
+        ctx->norm_tile,
         (uint16_t)query_rows,
         MODEL_DIM,
         &layer->w_q[head_idx][0][0],
         HEAD_DIM,
         NULL,
-        g_query_tile);
+        ctx->query_tile);
 
     /* Apply RoPE to the active query tile using absolute token positions. */
-    apply_rope_q7_inplace(g_query_tile, query_rows, query_start);
-    cycle_span_end(&g_cycle_profile.head_q_proj[layer_idx][head_idx]);
+    apply_rope_q7_inplace(ctx->query_tile, query_rows, query_start);
+    cycle_span_end(ctx, &ctx->cycle_profile.head_q_proj[layer_idx][head_idx]);
 
     /* Seed each query row from the first key so the steady-state loop has no empty-row branch. */
     for (uint32_t q = 0; q < query_rows; ++q) {
-        const q7_t *query_vec = &g_query_tile[q * HEAD_DIM];
-        const q7_t *first_key_vec = &g_head_k_cache[0];
-        const q7_t *first_value_vec = &g_head_v_cache[0];
+        const q7_t *query_vec = &ctx->query_tile[q * HEAD_DIM];
+        const q7_t *first_key_vec = &ctx->head_k_cache[0];
+        const q7_t *first_value_vec = &ctx->head_v_cache[0];
 
-        g_row_max[q] = dot_q7_head(query_vec, first_key_vec);
-        g_row_sum[q] = SOFTMAX_Q12_ONE;
-        init_row_acc_from_value_q12(&g_row_acc[q * HEAD_DIM], first_value_vec);
+        ctx->row_max[q] = dot_q7_head(query_vec, first_key_vec);
+        ctx->row_sum[q] = SOFTMAX_Q12_ONE;
+        init_row_acc_from_value_q12(&ctx->row_acc[q * HEAD_DIM], first_value_vec);
     }
 
     for (uint32_t key_start = 0; key_start < INPUT_SEQ_LEN; key_start += KEY_TILE) {
         uint32_t key_offset = (key_start == 0U) ? 1U : 0U;
         uint32_t key_rows = min_u32(KEY_TILE, INPUT_SEQ_LEN - key_start);
-        const q7_t *key_tile = &g_head_k_cache[key_start * HEAD_DIM];
-        const q7_t *value_tile = &g_head_v_cache[key_start * HEAD_DIM];
-        cycle_span_begin(&g_cycle_profile.head_score[layer_idx][head_idx]);
+        const q7_t *key_tile = &ctx->head_k_cache[key_start * HEAD_DIM];
+        const q7_t *value_tile = &ctx->head_v_cache[key_start * HEAD_DIM];
+        cycle_span_begin(ctx, &ctx->cycle_profile.head_score[layer_idx][head_idx]);
 
         /* Materialize one exact score tile, then stream the online softmax/value update over it. */
-        compute_score_tile_q7(g_query_tile, key_tile, query_rows, key_rows);
-        cycle_span_end(&g_cycle_profile.head_score[layer_idx][head_idx]);
+        compute_score_tile_q7(ctx, ctx->query_tile, key_tile, query_rows, key_rows);
+        cycle_span_end(ctx, &ctx->cycle_profile.head_score[layer_idx][head_idx]);
 
-        cycle_span_begin(&g_cycle_profile.head_softmax[layer_idx][head_idx]);
+        cycle_span_begin(ctx, &ctx->cycle_profile.head_softmax[layer_idx][head_idx]);
 
         for (uint32_t q = 0; q < query_rows; ++q) {
-            const int16_t *score_row = &g_score_tile[q * KEY_TILE];
-            int16_t row_max = g_row_max[q];
-            int32_t row_sum = g_row_sum[q];
-            int32_t *row_acc = &g_row_acc[q * HEAD_DIM];
+            const int16_t *score_row = &ctx->score_tile[q * KEY_TILE];
+            int16_t row_max = ctx->row_max[q];
+            int32_t row_sum = ctx->row_sum[q];
+            int32_t *row_acc = &ctx->row_acc[q * HEAD_DIM];
             const q7_t *value_vec = value_tile + key_offset * HEAD_DIM;
 
             for (uint32_t k = key_offset; k < key_rows; ++k) {
@@ -743,27 +780,31 @@ static void run_attention_head_block_with_cache(
                 value_vec += HEAD_DIM;
             }
 
-            g_row_max[q] = row_max;
-            g_row_sum[q] = row_sum;
+            ctx->row_max[q] = row_max;
+            ctx->row_sum[q] = row_sum;
         }
 
-        cycle_span_end(&g_cycle_profile.head_softmax[layer_idx][head_idx]);
+        cycle_span_end(ctx, &ctx->cycle_profile.head_softmax[layer_idx][head_idx]);
     }
 
-    cycle_span_begin(&g_cycle_profile.head_normalize[layer_idx][head_idx]);
+    cycle_span_begin(ctx, &ctx->cycle_profile.head_normalize[layer_idx][head_idx]);
 
     for (uint32_t q = 0; q < query_rows; ++q) {
         /* Store this head's normalized context into a compact 16-wide tile scratch. */
         normalize_row_acc_to_q7(
-            &g_row_acc[q * HEAD_DIM],
-            g_row_sum[q],
+            &ctx->row_acc[q * HEAD_DIM],
+            ctx->row_sum[q],
             &head_context_tile[q * HEAD_DIM]);
     }
 
-    cycle_span_end(&g_cycle_profile.head_normalize[layer_idx][head_idx]);
+    cycle_span_end(ctx, &ctx->cycle_profile.head_normalize[layer_idx][head_idx]);
 }
 
-static void build_head_kv_cache(const q7_t *input_sequence, const model_layer_t *layer, uint32_t head_idx)
+static void build_head_kv_cache(
+    tiled_attention_ctx_t *ctx,
+    const q7_t *input_sequence,
+    const model_layer_t *layer,
+    uint32_t head_idx)
 {
     for (uint32_t tile_start = 0; tile_start < INPUT_SEQ_LEN; tile_start += QUERY_TILE) {
         uint32_t tile_rows = min_u32(QUERY_TILE, INPUT_SEQ_LEN - tile_start);
@@ -774,48 +815,51 @@ static void build_head_kv_cache(const q7_t *input_sequence, const model_layer_t 
             (uint16_t)tile_rows,
             MODEL_DIM,
             layer->rms_attn_w_q14,
-            g_norm_tile);
+            ctx->norm_tile);
 
         /* Materialize this head's full K sequence once so all query tiles can reuse it. */
         q7_linear_block(
-            g_norm_tile,
+            ctx,
+            ctx->norm_tile,
             (uint16_t)tile_rows,
             MODEL_DIM,
             &layer->w_k[head_idx][0][0],
             HEAD_DIM,
             NULL,
-            g_head_k_cache + tile_start * HEAD_DIM);
+            ctx->head_k_cache + tile_start * HEAD_DIM);
 
         /* Materialize this head's full V sequence once for the same reason. */
         q7_linear_block(
-            g_norm_tile,
+            ctx,
+            ctx->norm_tile,
             (uint16_t)tile_rows,
             MODEL_DIM,
             &layer->w_v[head_idx][0][0],
             HEAD_DIM,
             NULL,
-            g_head_v_cache + tile_start * HEAD_DIM);
+            ctx->head_v_cache + tile_start * HEAD_DIM);
     }
 
     /* Apply RoPE once to the cached K rows so all query tiles reuse the rotated keys. */
-    apply_rope_q7_inplace(g_head_k_cache, INPUT_SEQ_LEN, 0U);
+    apply_rope_q7_inplace(ctx->head_k_cache, INPUT_SEQ_LEN, 0U);
 }
 
 static void run_transformer_layer(
+    tiled_attention_ctx_t *ctx,
     const q7_t *current_sequence,
     q7_t *next_sequence,
     const model_layer_t *layer,
     uint32_t layer_idx)
 {
-    cycle_span_begin(&g_cycle_profile.layer_total[layer_idx]);
+    cycle_span_begin(ctx, &ctx->cycle_profile.layer_total[layer_idx]);
 
     /* First phase: accumulate all head outputs into the next 24-wide sequence buffer. */
     arm_fill_q7(0, next_sequence, INPUT_SEQ_LEN * MODEL_DIM);
 
     for (uint32_t head_idx = 0; head_idx < NUM_HEADS; ++head_idx) {
-        cycle_span_begin(&g_cycle_profile.head_kv_cache[layer_idx][head_idx]);
-        build_head_kv_cache(current_sequence, layer, head_idx);
-        cycle_span_end(&g_cycle_profile.head_kv_cache[layer_idx][head_idx]);
+        cycle_span_begin(ctx, &ctx->cycle_profile.head_kv_cache[layer_idx][head_idx]);
+        build_head_kv_cache(ctx, current_sequence, layer, head_idx);
+        cycle_span_end(ctx, &ctx->cycle_profile.head_kv_cache[layer_idx][head_idx]);
 
         for (uint32_t query_start = 0; query_start < INPUT_SEQ_LEN; query_start += QUERY_TILE) {
             uint32_t query_rows = min_u32(QUERY_TILE, INPUT_SEQ_LEN - query_start);
@@ -823,37 +867,39 @@ static void run_transformer_layer(
 
             /* Run this head against all cached K/V rows and emit one 16-wide context tile. */
             run_attention_head_block_with_cache(
+                ctx,
                 current_sequence,
                 layer,
                 layer_idx,
                 head_idx,
                 query_start,
                 query_rows,
-                g_head_context_tile);
+                ctx->head_context_tile);
 
-            cycle_span_begin(&g_cycle_profile.head_out_proj[layer_idx][head_idx]);
+            cycle_span_begin(ctx, &ctx->cycle_profile.head_out_proj[layer_idx][head_idx]);
 
             /* Project this head through its W_o slice and accumulate into the 24-wide output tile. */
             q7_linear_block(
-                g_head_context_tile,
+                ctx,
+                ctx->head_context_tile,
                 (uint16_t)query_rows,
                 HEAD_DIM,
                 &layer->w_o[head_idx * HEAD_DIM][0],
                 MODEL_DIM,
                 NULL,
-                g_context_tile);
+                ctx->context_tile);
 
             arm_add_q7(
                 next_sequence + query_start * MODEL_DIM,
-                g_context_tile,
+                ctx->context_tile,
                 next_sequence + query_start * MODEL_DIM,
                 tile_elems);
 
-            cycle_span_end(&g_cycle_profile.head_out_proj[layer_idx][head_idx]);
+            cycle_span_end(ctx, &ctx->cycle_profile.head_out_proj[layer_idx][head_idx]);
         }
     }
 
-    cycle_span_begin(&g_cycle_profile.layer_ffn[layer_idx]);
+    cycle_span_begin(ctx, &ctx->cycle_profile.layer_ffn[layer_idx]);
 
     /* Second phase: apply output bias, residual, and the 24->24->24 feed-forward block tile by tile. */
     for (uint32_t query_start = 0; query_start < INPUT_SEQ_LEN; query_start += QUERY_TILE) {
@@ -867,83 +913,86 @@ static void run_transformer_layer(
         arm_add_q7(
             current_sequence + query_start * MODEL_DIM,
             next_sequence + query_start * MODEL_DIM,
-            g_residual_tile,
+            ctx->residual_tile,
             tile_elems);
 
         /* Pre-norm the residual tile before the feed-forward block. */
         rmsnorm_q7_block(
-            g_residual_tile,
+            ctx->residual_tile,
             (uint16_t)query_rows,
             MODEL_DIM,
             layer->rms_ffn_w_q14,
-            g_norm_tile);
+            ctx->norm_tile);
 
         /* Apply the widened 24->FFN_DIM feed-forward projection on the normalized residual tile. */
         q7_linear_block(
-            g_norm_tile,
+            ctx,
+            ctx->norm_tile,
             (uint16_t)query_rows,
             MODEL_DIM,
             &layer->w_ff1[0][0],
             FFN_DIM,
             layer->b_ff1,
-            g_work_tile);
+            ctx->work_tile);
 
         /* Apply the non-linearity across the widened hidden channels. */
-        relu_q7_inplace(g_work_tile, query_rows * FFN_DIM);
+        relu_q7_inplace(ctx->work_tile, query_rows * FFN_DIM);
 
         /* Project back to the model width and reuse the tile scratch as FFN output. */
         q7_linear_block(
-            g_work_tile,
+            ctx,
+            ctx->work_tile,
             (uint16_t)query_rows,
             FFN_DIM,
             &layer->w_ff2[0][0],
             MODEL_DIM,
             layer->b_ff2,
-            g_context_tile);
+            ctx->context_tile);
 
         /* Overwrite the spare sequence buffer tile with the final layer output. */
         arm_add_q7(
-            g_residual_tile,
-            g_context_tile,
+            ctx->residual_tile,
+            ctx->context_tile,
             next_sequence + query_start * MODEL_DIM,
             tile_elems);
     }
 
-    cycle_span_end(&g_cycle_profile.layer_ffn[layer_idx]);
-    cycle_span_end(&g_cycle_profile.layer_total[layer_idx]);
+    cycle_span_end(ctx, &ctx->cycle_profile.layer_ffn[layer_idx]);
+    cycle_span_end(ctx, &ctx->cycle_profile.layer_total[layer_idx]);
 }
 
-static void classify_sequence(const q7_t *sequence, q7_t *output)
+static void classify_sequence(tiled_attention_ctx_t *ctx, const q7_t *sequence, q7_t *output)
 {
     for (uint32_t output_start = 0; output_start < OUTPUT_SEQ_LEN; output_start += QUERY_TILE) {
         uint32_t output_rows = min_u32(QUERY_TILE, OUTPUT_SEQ_LEN - output_start);
 
         /* Apply the 24->4 output classifier directly on the final sequence tile. */
         q7_linear_block(
+            ctx,
             sequence + output_start * MODEL_DIM,
             (uint16_t)output_rows,
             MODEL_DIM,
             &g_classifier_w[0][0],
             NUM_CLASSES,
             g_classifier_b,
-            g_classifier_tile);
+            ctx->classifier_tile);
 
         arm_copy_q7(
-            g_classifier_tile,
+            ctx->classifier_tile,
             output + output_start * NUM_CLASSES,
             output_rows * NUM_CLASSES);
     }
 }
 
-static void run_model(q7_t *buffer_a, q7_t *buffer_b, q7_t *output)
+static void run_model(tiled_attention_ctx_t *ctx, q7_t *buffer_a, q7_t *buffer_b, q7_t *output)
 {
     q7_t *current = buffer_a;
     q7_t *next = buffer_b;
-    cycle_span_begin(&g_cycle_profile.run_model);
+    cycle_span_begin(ctx, &ctx->cycle_profile.run_model);
 
     /* Run the stacked transformer blocks in sequence, swapping the two sequence buffers each layer. */
     for (uint32_t layer_idx = 0; layer_idx < NUM_LAYERS; ++layer_idx) {
-        run_transformer_layer(current, next, &g_model_layers[layer_idx], layer_idx);
+        run_transformer_layer(ctx, current, next, &g_model_layers[layer_idx], layer_idx);
 
         q7_t *tmp = current;
         current = next;
@@ -951,37 +1000,39 @@ static void run_model(q7_t *buffer_a, q7_t *buffer_b, q7_t *output)
     }
 
     /* Emit one 24->4 classifier row per final sequence position. */
-    cycle_span_begin(&g_cycle_profile.classify);
-    classify_sequence(current, output);
-    cycle_span_end(&g_cycle_profile.classify);
-    cycle_span_end(&g_cycle_profile.run_model);
+    cycle_span_begin(ctx, &ctx->cycle_profile.classify);
+    classify_sequence(ctx, current, output);
+    cycle_span_end(ctx, &ctx->cycle_profile.classify);
+    cycle_span_end(ctx, &ctx->cycle_profile.run_model);
 }
 
 int main(void)
 {
     uint32_t checksum = 0;
+    tiled_attention_ctx_t *ctx;
 
     if ((NUM_HEADS * HEAD_DIM) != ATTN_DIM) {
         fprintf(stderr, "invalid head packing\n");
         return 1;
     }
 
-    cycle_profile_init();
+    ctx = alloc_tiled_attention_ctx();
+    cycle_profile_init(ctx);
 
     /* Populate the fixed-size input tensor. */
-    cycle_span_begin(&g_cycle_profile.fill_input);
-    fill_demo_input(g_hidden_a);
-    cycle_span_end(&g_cycle_profile.fill_input);
+    cycle_span_begin(ctx, &ctx->cycle_profile.fill_input);
+    fill_demo_input(ctx->hidden_a);
+    cycle_span_end(ctx, &ctx->cycle_profile.fill_input);
 
     /* Run the low-memory int8 model end to end. */
-    run_model(g_hidden_a, g_hidden_b, g_output);
-    maybe_dump_output(g_output, OUTPUT_SEQ_LEN * NUM_CLASSES);
+    run_model(ctx, ctx->hidden_a, ctx->hidden_b, ctx->output);
+    maybe_dump_output(ctx->output, OUTPUT_SEQ_LEN * NUM_CLASSES);
 
     /* Print a small prefix of the logits so the binary has a visible result. */
     for (uint32_t row = 0; row < min_u32(8U, OUTPUT_SEQ_LEN); ++row) {
         printf("%4lu:", (unsigned long)row);
         for (uint32_t col = 0; col < NUM_CLASSES; ++col) {
-            q7_t value = g_output[row * NUM_CLASSES + col];
+            q7_t value = ctx->output[row * NUM_CLASSES + col];
             checksum = checksum * 131u + (uint8_t)value;
             printf(" %4d", value);
         }
@@ -990,12 +1041,13 @@ int main(void)
 
     for (uint32_t row = 8; row < OUTPUT_SEQ_LEN; ++row) {
         for (uint32_t col = 0; col < NUM_CLASSES; ++col) {
-            checksum = checksum * 131u + (uint8_t)g_output[row * NUM_CLASSES + col];
+            checksum = checksum * 131u + (uint8_t)ctx->output[row * NUM_CLASSES + col];
         }
     }
 
     printf("checksum: 0x%08lx\n", (unsigned long)checksum);
-    cycle_profile_finalize();
-    print_cycle_profile_summary();
+    cycle_profile_finalize(ctx);
+    print_cycle_profile_summary(ctx);
+    free_tiled_attention_ctx(ctx);
     return 0;
 }
