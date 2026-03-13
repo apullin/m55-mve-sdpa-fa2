@@ -33,18 +33,25 @@ static int32_t ALIGN_16 g_row_sum[QUERY_TILE];
 static int32_t ALIGN_16 g_row_acc[QUERY_TILE * HEAD_DIM];
 
 typedef struct {
+    /* Repeated regions accumulate raw start/end timestamps; finalize computes end_sum - start_sum. */
+    uint64_t start_sum;
+    uint64_t end_sum;
+    uint64_t cycles;
+} cycle_span_t;
+
+typedef struct {
     uint32_t enabled;
-    uint32_t fill_input_cycles;
-    uint32_t run_model_cycles;
-    uint32_t classify_cycles;
-    uint32_t layer_total_cycles[NUM_LAYERS];
-    uint32_t layer_ffn_cycles[NUM_LAYERS];
-    uint32_t head_kv_cache_cycles[NUM_LAYERS][NUM_HEADS];
-    uint32_t head_q_proj_cycles[NUM_LAYERS][NUM_HEADS];
-    uint32_t head_score_cycles[NUM_LAYERS][NUM_HEADS];
-    uint32_t head_softmax_cycles[NUM_LAYERS][NUM_HEADS];
-    uint32_t head_normalize_cycles[NUM_LAYERS][NUM_HEADS];
-    uint32_t head_out_proj_cycles[NUM_LAYERS][NUM_HEADS];
+    cycle_span_t fill_input;
+    cycle_span_t run_model;
+    cycle_span_t classify;
+    cycle_span_t layer_total[NUM_LAYERS];
+    cycle_span_t layer_ffn[NUM_LAYERS];
+    cycle_span_t head_kv_cache[NUM_LAYERS][NUM_HEADS];
+    cycle_span_t head_q_proj[NUM_LAYERS][NUM_HEADS];
+    cycle_span_t head_score[NUM_LAYERS][NUM_HEADS];
+    cycle_span_t head_softmax[NUM_LAYERS][NUM_HEADS];
+    cycle_span_t head_normalize[NUM_LAYERS][NUM_HEADS];
+    cycle_span_t head_out_proj[NUM_LAYERS][NUM_HEADS];
 } model_cycle_profile_t;
 
 /* This global can be inspected under a debugger after inference, even if printing is disabled. */
@@ -86,15 +93,47 @@ static void cycle_profile_init(void)
     g_cycle_profile.enabled = 1U;
 }
 
-static uint32_t cycle_profile_now(void)
-{
-    return g_cycle_profile.enabled ? DWT->CYCCNT : 0U;
-}
-
-static void cycle_profile_add(volatile uint32_t *dst, uint32_t start_cycles)
+static void cycle_span_begin(volatile cycle_span_t *span)
 {
     if (g_cycle_profile.enabled) {
-        *dst += DWT->CYCCNT - start_cycles;
+        span->start_sum += (uint64_t)DWT->CYCCNT;
+    }
+}
+
+static void cycle_span_end(volatile cycle_span_t *span)
+{
+    if (g_cycle_profile.enabled) {
+        span->end_sum += (uint64_t)DWT->CYCCNT;
+    }
+}
+
+static void cycle_span_finalize(volatile cycle_span_t *span)
+{
+    span->cycles = span->end_sum - span->start_sum;
+}
+
+static void cycle_profile_finalize(void)
+{
+    if (!g_cycle_profile.enabled) {
+        return;
+    }
+
+    cycle_span_finalize(&g_cycle_profile.fill_input);
+    cycle_span_finalize(&g_cycle_profile.run_model);
+    cycle_span_finalize(&g_cycle_profile.classify);
+
+    for (uint32_t layer_idx = 0; layer_idx < NUM_LAYERS; ++layer_idx) {
+        cycle_span_finalize(&g_cycle_profile.layer_total[layer_idx]);
+        cycle_span_finalize(&g_cycle_profile.layer_ffn[layer_idx]);
+
+        for (uint32_t head_idx = 0; head_idx < NUM_HEADS; ++head_idx) {
+            cycle_span_finalize(&g_cycle_profile.head_kv_cache[layer_idx][head_idx]);
+            cycle_span_finalize(&g_cycle_profile.head_q_proj[layer_idx][head_idx]);
+            cycle_span_finalize(&g_cycle_profile.head_score[layer_idx][head_idx]);
+            cycle_span_finalize(&g_cycle_profile.head_softmax[layer_idx][head_idx]);
+            cycle_span_finalize(&g_cycle_profile.head_normalize[layer_idx][head_idx]);
+            cycle_span_finalize(&g_cycle_profile.head_out_proj[layer_idx][head_idx]);
+        }
     }
 }
 
@@ -105,28 +144,28 @@ static void print_cycle_profile_summary(void)
         return;
     }
 
-    printf("cycle-profile: total=%lu fill=%lu classify=%lu\n",
-        (unsigned long)g_cycle_profile.run_model_cycles,
-        (unsigned long)g_cycle_profile.fill_input_cycles,
-        (unsigned long)g_cycle_profile.classify_cycles);
+    printf("cycle-profile: total=%llu fill=%llu classify=%llu\n",
+        (unsigned long long)g_cycle_profile.run_model.cycles,
+        (unsigned long long)g_cycle_profile.fill_input.cycles,
+        (unsigned long long)g_cycle_profile.classify.cycles);
 
     for (uint32_t layer_idx = 0; layer_idx < NUM_LAYERS; ++layer_idx) {
-        printf("cycle-profile: layer%lu total=%lu ffn=%lu\n",
+        printf("cycle-profile: layer%lu total=%llu ffn=%llu\n",
             (unsigned long)layer_idx,
-            (unsigned long)g_cycle_profile.layer_total_cycles[layer_idx],
-            (unsigned long)g_cycle_profile.layer_ffn_cycles[layer_idx]);
+            (unsigned long long)g_cycle_profile.layer_total[layer_idx].cycles,
+            (unsigned long long)g_cycle_profile.layer_ffn[layer_idx].cycles);
 
         for (uint32_t head_idx = 0; head_idx < NUM_HEADS; ++head_idx) {
             printf(
-                "cycle-profile: layer%lu head%lu kv=%lu q=%lu score=%lu softmax=%lu norm=%lu out=%lu\n",
+                "cycle-profile: layer%lu head%lu kv=%llu q=%llu score=%llu softmax=%llu norm=%llu out=%llu\n",
                 (unsigned long)layer_idx,
                 (unsigned long)head_idx,
-                (unsigned long)g_cycle_profile.head_kv_cache_cycles[layer_idx][head_idx],
-                (unsigned long)g_cycle_profile.head_q_proj_cycles[layer_idx][head_idx],
-                (unsigned long)g_cycle_profile.head_score_cycles[layer_idx][head_idx],
-                (unsigned long)g_cycle_profile.head_softmax_cycles[layer_idx][head_idx],
-                (unsigned long)g_cycle_profile.head_normalize_cycles[layer_idx][head_idx],
-                (unsigned long)g_cycle_profile.head_out_proj_cycles[layer_idx][head_idx]);
+                (unsigned long long)g_cycle_profile.head_kv_cache[layer_idx][head_idx].cycles,
+                (unsigned long long)g_cycle_profile.head_q_proj[layer_idx][head_idx].cycles,
+                (unsigned long long)g_cycle_profile.head_score[layer_idx][head_idx].cycles,
+                (unsigned long long)g_cycle_profile.head_softmax[layer_idx][head_idx].cycles,
+                (unsigned long long)g_cycle_profile.head_normalize[layer_idx][head_idx].cycles,
+                (unsigned long long)g_cycle_profile.head_out_proj[layer_idx][head_idx].cycles);
         }
     }
 }
@@ -135,15 +174,18 @@ static void cycle_profile_init(void)
 {
 }
 
-static uint32_t cycle_profile_now(void)
+static void cycle_span_begin(volatile cycle_span_t *span)
 {
-    return 0U;
+    (void)span;
 }
 
-static void cycle_profile_add(volatile uint32_t *dst, uint32_t start_cycles)
+static void cycle_span_end(volatile cycle_span_t *span)
 {
-    (void)dst;
-    (void)start_cycles;
+    (void)span;
+}
+
+static void cycle_profile_finalize(void)
+{
 }
 
 static void print_cycle_profile_summary(void)
@@ -588,7 +630,7 @@ static void run_attention_head_block_with_cache(
     uint32_t query_rows,
     q7_t *head_context_tile)
 {
-    uint32_t q_proj_start = cycle_profile_now();
+    cycle_span_begin(&g_cycle_profile.head_q_proj[layer_idx][head_idx]);
 
     /* Project just the active query tile for this head. */
     q7_linear_block(
@@ -602,7 +644,7 @@ static void run_attention_head_block_with_cache(
 
     /* Apply RoPE to the active query tile using absolute token positions. */
     apply_rope_q7_inplace(g_query_tile, query_rows, query_start);
-    cycle_profile_add(&g_cycle_profile.head_q_proj_cycles[layer_idx][head_idx], q_proj_start);
+    cycle_span_end(&g_cycle_profile.head_q_proj[layer_idx][head_idx]);
 
     /* Seed each query row from the first key so the steady-state loop has no empty-row branch. */
     for (uint32_t q = 0; q < query_rows; ++q) {
@@ -620,13 +662,13 @@ static void run_attention_head_block_with_cache(
         uint32_t key_rows = min_u32(KEY_TILE, INPUT_SEQ_LEN - key_start);
         const q7_t *key_tile = &g_head_k_cache[key_start * HEAD_DIM];
         const q7_t *value_tile = &g_head_v_cache[key_start * HEAD_DIM];
-        uint32_t score_start = cycle_profile_now();
+        cycle_span_begin(&g_cycle_profile.head_score[layer_idx][head_idx]);
 
         /* Materialize one exact score tile, then stream the online softmax/value update over it. */
         compute_score_tile_q7(g_query_tile, key_tile, query_rows, key_rows);
-        cycle_profile_add(&g_cycle_profile.head_score_cycles[layer_idx][head_idx], score_start);
+        cycle_span_end(&g_cycle_profile.head_score[layer_idx][head_idx]);
 
-        uint32_t softmax_start = cycle_profile_now();
+        cycle_span_begin(&g_cycle_profile.head_softmax[layer_idx][head_idx]);
 
         for (uint32_t q = 0; q < query_rows; ++q) {
             const int16_t *score_row = &g_score_tile[q * KEY_TILE];
@@ -660,10 +702,10 @@ static void run_attention_head_block_with_cache(
             g_row_sum[q] = row_sum;
         }
 
-        cycle_profile_add(&g_cycle_profile.head_softmax_cycles[layer_idx][head_idx], softmax_start);
+        cycle_span_end(&g_cycle_profile.head_softmax[layer_idx][head_idx]);
     }
 
-    uint32_t normalize_start = cycle_profile_now();
+    cycle_span_begin(&g_cycle_profile.head_normalize[layer_idx][head_idx]);
 
     for (uint32_t q = 0; q < query_rows; ++q) {
         /* Store this head's normalized context into a compact 16-wide tile scratch. */
@@ -673,7 +715,7 @@ static void run_attention_head_block_with_cache(
             &head_context_tile[q * HEAD_DIM]);
     }
 
-    cycle_profile_add(&g_cycle_profile.head_normalize_cycles[layer_idx][head_idx], normalize_start);
+    cycle_span_end(&g_cycle_profile.head_normalize[layer_idx][head_idx]);
 }
 
 static void build_head_kv_cache(const q7_t *input_sequence, const model_layer_t *layer, uint32_t head_idx)
@@ -708,15 +750,15 @@ static void run_transformer_layer(
     const model_layer_t *layer,
     uint32_t layer_idx)
 {
-    uint32_t layer_start = cycle_profile_now();
+    cycle_span_begin(&g_cycle_profile.layer_total[layer_idx]);
 
     /* First phase: accumulate all head outputs into the next 24-wide sequence buffer. */
     arm_fill_q7(0, next_sequence, INPUT_SEQ_LEN * MODEL_DIM);
 
     for (uint32_t head_idx = 0; head_idx < NUM_HEADS; ++head_idx) {
-        uint32_t kv_start = cycle_profile_now();
+        cycle_span_begin(&g_cycle_profile.head_kv_cache[layer_idx][head_idx]);
         build_head_kv_cache(current_sequence, layer, head_idx);
-        cycle_profile_add(&g_cycle_profile.head_kv_cache_cycles[layer_idx][head_idx], kv_start);
+        cycle_span_end(&g_cycle_profile.head_kv_cache[layer_idx][head_idx]);
 
         for (uint32_t query_start = 0; query_start < INPUT_SEQ_LEN; query_start += QUERY_TILE) {
             uint32_t query_rows = min_u32(QUERY_TILE, INPUT_SEQ_LEN - query_start);
@@ -732,7 +774,7 @@ static void run_transformer_layer(
                 query_rows,
                 g_head_context_tile);
 
-            uint32_t out_proj_start = cycle_profile_now();
+            cycle_span_begin(&g_cycle_profile.head_out_proj[layer_idx][head_idx]);
 
             /* Project this head through its W_o slice and accumulate into the 24-wide output tile. */
             q7_linear_block(
@@ -750,11 +792,11 @@ static void run_transformer_layer(
                 next_sequence + query_start * MODEL_DIM,
                 tile_elems);
 
-            cycle_profile_add(&g_cycle_profile.head_out_proj_cycles[layer_idx][head_idx], out_proj_start);
+            cycle_span_end(&g_cycle_profile.head_out_proj[layer_idx][head_idx]);
         }
     }
 
-    uint32_t ffn_start = cycle_profile_now();
+    cycle_span_begin(&g_cycle_profile.layer_ffn[layer_idx]);
 
     /* Second phase: apply output bias, residual, and the 24->24->24 feed-forward block tile by tile. */
     for (uint32_t query_start = 0; query_start < INPUT_SEQ_LEN; query_start += QUERY_TILE) {
@@ -802,8 +844,8 @@ static void run_transformer_layer(
             tile_elems);
     }
 
-    cycle_profile_add(&g_cycle_profile.layer_ffn_cycles[layer_idx], ffn_start);
-    cycle_profile_add(&g_cycle_profile.layer_total_cycles[layer_idx], layer_start);
+    cycle_span_end(&g_cycle_profile.layer_ffn[layer_idx]);
+    cycle_span_end(&g_cycle_profile.layer_total[layer_idx]);
 }
 
 static void classify_sequence(const q7_t *sequence, q7_t *output)
@@ -832,7 +874,7 @@ static void run_model(q7_t *buffer_a, q7_t *buffer_b, q7_t *output)
 {
     q7_t *current = buffer_a;
     q7_t *next = buffer_b;
-    uint32_t model_start = cycle_profile_now();
+    cycle_span_begin(&g_cycle_profile.run_model);
 
     /* Run the stacked transformer blocks in sequence, swapping the two sequence buffers each layer. */
     for (uint32_t layer_idx = 0; layer_idx < NUM_LAYERS; ++layer_idx) {
@@ -844,10 +886,10 @@ static void run_model(q7_t *buffer_a, q7_t *buffer_b, q7_t *output)
     }
 
     /* Emit one 24->4 classifier row per final sequence position. */
-    uint32_t classify_start = cycle_profile_now();
+    cycle_span_begin(&g_cycle_profile.classify);
     classify_sequence(current, output);
-    cycle_profile_add(&g_cycle_profile.classify_cycles, classify_start);
-    cycle_profile_add(&g_cycle_profile.run_model_cycles, model_start);
+    cycle_span_end(&g_cycle_profile.classify);
+    cycle_span_end(&g_cycle_profile.run_model);
 }
 
 int main(void)
@@ -862,9 +904,9 @@ int main(void)
     cycle_profile_init();
 
     /* Populate the fixed-size input tensor. */
-    uint32_t fill_start = cycle_profile_now();
+    cycle_span_begin(&g_cycle_profile.fill_input);
     fill_demo_input(g_hidden_a);
-    cycle_profile_add(&g_cycle_profile.fill_input_cycles, fill_start);
+    cycle_span_end(&g_cycle_profile.fill_input);
 
     /* Run the low-memory int8 model end to end. */
     run_model(g_hidden_a, g_hidden_b, g_output);
@@ -888,6 +930,7 @@ int main(void)
     }
 
     printf("checksum: 0x%08lx\n", (unsigned long)checksum);
+    cycle_profile_finalize();
     print_cycle_profile_summary();
     return 0;
 }
