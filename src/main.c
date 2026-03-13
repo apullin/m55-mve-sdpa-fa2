@@ -111,11 +111,69 @@ static void add_bias_rows(q7_t *block, uint16_t rows, uint16_t cols, const q7_t 
 
 static int16_t dot_q7_head(const q7_t *a, const q7_t *b)
 {
+#if defined(ARM_MATH_MVEI) && !defined(ARM_MATH_AUTOVECTORIZE) && (HEAD_DIM == 16)
+    q7x16_t vec_a = vld1q(a);
+    q7x16_t vec_b = vld1q(b);
+    q31_t score_acc = vmladavaq(0, vec_a, vec_b);
+#else
     q31_t score_acc = 0;
-
-    /* HEAD_DIM is 16, so the CMSIS-DSP q7 dot product maps to one clean Helium vector. */
     arm_dot_prod_q7(a, b, HEAD_DIM, &score_acc);
+#endif
     return (int16_t)(score_acc >> ATTN_SCORE_SHIFT);
+}
+
+static void init_row_acc_from_value_q12(int32_t *acc, const q7_t *value_vec)
+{
+#if defined(ARM_MATH_MVEI) && !defined(ARM_MATH_AUTOVECTORIZE) && (HEAD_DIM == 16)
+    q31x4_t val0 = vldrbq_s32(value_vec + 0);
+    q31x4_t val1 = vldrbq_s32(value_vec + 4);
+    q31x4_t val2 = vldrbq_s32(value_vec + 8);
+    q31x4_t val3 = vldrbq_s32(value_vec + 12);
+
+    vstrwq_s32(acc + 0, vmulq_n_s32(val0, SOFTMAX_Q12_ONE));
+    vstrwq_s32(acc + 4, vmulq_n_s32(val1, SOFTMAX_Q12_ONE));
+    vstrwq_s32(acc + 8, vmulq_n_s32(val2, SOFTMAX_Q12_ONE));
+    vstrwq_s32(acc + 12, vmulq_n_s32(val3, SOFTMAX_Q12_ONE));
+#else
+    for (uint32_t d = 0; d < HEAD_DIM; ++d) {
+        acc[d] = SOFTMAX_Q12_ONE * value_vec[d];
+    }
+#endif
+}
+
+static void scale_row_acc_q12_inplace(int32_t *acc, uint16_t alpha_q12)
+{
+    for (uint32_t d = 0; d < HEAD_DIM; ++d) {
+        acc[d] = (acc[d] * alpha_q12 + (SOFTMAX_Q12_ONE / 2)) >> 12;
+    }
+}
+
+static void add_weighted_value_q12(int32_t *acc, const q7_t *value_vec, uint16_t weight_q12)
+{
+#if defined(ARM_MATH_MVEI) && !defined(ARM_MATH_AUTOVECTORIZE) && (HEAD_DIM == 16)
+    q31x4_t val0 = vldrbq_s32(value_vec + 0);
+    q31x4_t val1 = vldrbq_s32(value_vec + 4);
+    q31x4_t val2 = vldrbq_s32(value_vec + 8);
+    q31x4_t val3 = vldrbq_s32(value_vec + 12);
+    q31x4_t acc0 = vld1q(acc + 0);
+    q31x4_t acc1 = vld1q(acc + 4);
+    q31x4_t acc2 = vld1q(acc + 8);
+    q31x4_t acc3 = vld1q(acc + 12);
+
+    acc0 = vaddq(acc0, vmulq_n_s32(val0, (int32_t)weight_q12));
+    acc1 = vaddq(acc1, vmulq_n_s32(val1, (int32_t)weight_q12));
+    acc2 = vaddq(acc2, vmulq_n_s32(val2, (int32_t)weight_q12));
+    acc3 = vaddq(acc3, vmulq_n_s32(val3, (int32_t)weight_q12));
+
+    vstrwq_s32(acc + 0, acc0);
+    vstrwq_s32(acc + 4, acc1);
+    vstrwq_s32(acc + 8, acc2);
+    vstrwq_s32(acc + 12, acc3);
+#else
+    for (uint32_t d = 0; d < HEAD_DIM; ++d) {
+        acc[d] += weight_q12 * value_vec[d];
+    }
+#endif
 }
 
 static void relu_q7_inplace(q7_t *data, uint32_t count)
@@ -205,19 +263,14 @@ static void run_attention_head_block_with_cache(
                 if (g_row_sum[q] == 0) {
                     g_row_max[q] = score;
                     g_row_sum[q] = SOFTMAX_Q12_ONE;
-                    for (uint32_t d = 0; d < HEAD_DIM; ++d) {
-                        g_row_acc[q * HEAD_DIM + d] = SOFTMAX_Q12_ONE * value_vec[d];
-                    }
+                    init_row_acc_from_value_q12(&g_row_acc[q * HEAD_DIM], value_vec);
                     continue;
                 }
 
                 if (score > g_row_max[q]) {
                     uint16_t alpha_q12 = softmax_decay_q12((int32_t)score - g_row_max[q]);
                     g_row_sum[q] = (g_row_sum[q] * alpha_q12 + (SOFTMAX_Q12_ONE / 2)) >> 12;
-                    for (uint32_t d = 0; d < HEAD_DIM; ++d) {
-                        int32_t *acc = &g_row_acc[q * HEAD_DIM + d];
-                        *acc = (*acc * alpha_q12 + (SOFTMAX_Q12_ONE / 2)) >> 12;
-                    }
+                    scale_row_acc_q12_inplace(&g_row_acc[q * HEAD_DIM], alpha_q12);
                     g_row_max[q] = score;
                     weight_q12 = SOFTMAX_Q12_ONE;
                 } else {
@@ -226,9 +279,7 @@ static void run_attention_head_block_with_cache(
 
                 /* Fold the new V contribution into the unnormalized weighted output. */
                 g_row_sum[q] += weight_q12;
-                for (uint32_t d = 0; d < HEAD_DIM; ++d) {
-                    g_row_acc[q * HEAD_DIM + d] += weight_q12 * value_vec[d];
-                }
+                add_weighted_value_q12(&g_row_acc[q * HEAD_DIM], value_vec, weight_q12);
             }
         }
     }
