@@ -422,6 +422,39 @@ static void fill_demo_input(q7_t *sequence)
     }
 }
 
+#if !defined(ARMCM55)
+static void maybe_dump_output(const q7_t *output, uint32_t count)
+{
+    const char *dump_path = getenv("TILED_ATTENTION_DUMP");
+    if ((dump_path == NULL) || (dump_path[0] == '\0')) {
+        return;
+    }
+
+    FILE *dump_file = fopen(dump_path, "wb");
+    if (dump_file == NULL) {
+        perror("fopen TILED_ATTENTION_DUMP");
+        exit(1);
+    }
+
+    if (fwrite(output, sizeof(q7_t), count, dump_file) != count) {
+        perror("fwrite TILED_ATTENTION_DUMP");
+        fclose(dump_file);
+        exit(1);
+    }
+
+    if (fclose(dump_file) != 0) {
+        perror("fclose TILED_ATTENTION_DUMP");
+        exit(1);
+    }
+}
+#else
+static void maybe_dump_output(const q7_t *output, uint32_t count)
+{
+    (void)output;
+    (void)count;
+}
+#endif
+
 static void run_attention_head_block_with_cache(
     const q7_t *input_sequence,
     const model_layer_t *layer,
@@ -671,6 +704,7 @@ int main(void)
 
     /* Run the low-memory int8 model end to end. */
     run_model(g_hidden_a, g_hidden_b, g_output);
+    maybe_dump_output(g_output, OUTPUT_SEQ_LEN * NUM_CLASSES);
 
     /* Print a small prefix of the logits so the binary has a visible result. */
     for (uint32_t row = 0; row < min_u32(8U, OUTPUT_SEQ_LEN); ++row) {

@@ -91,6 +91,24 @@ The final divide in normalization is still scalar because MVE does not provide v
 
 The PyTorch script is there to preserve semantic equivalence with the edge path, not to imitate a standard float attention implementation.
 
+## Parity Test
+
+The repo includes a host-side parity harness that compares the full q7 output tensor from the C binary against the PyTorch fixed-point mirror.
+
+1. Build the host binary.
+2. Run `tools/test_torch_parity.py` with a Python interpreter that has `torch` installed.
+3. By default the harness requires exact equality, but `--max-abs-diff` can be raised if you later want a tolerance-based check.
+
+Example:
+
+```sh
+cmake --build build-host-1200-nopool -j4
+/Users/andrewpullin/anaconda3/bin/python3.12 tools/test_torch_parity.py \
+  --binary build-host-1200-nopool/tiled_attention \
+  --python /Users/andrewpullin/anaconda3/bin/python3.12 \
+  --input-seq-len 1200
+```
+
 ## Build
 
 Host build:

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 import torch
@@ -299,6 +300,7 @@ def checksum_q7(data: torch.Tensor) -> int:
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input-seq-len", type=int, default=128, help="Sequence length for the demo run")
+    parser.add_argument("--dump-output", type=Path, default=None, help="Optional path to write raw q7 output bytes")
     return parser.parse_args(argv)
 
 
@@ -314,6 +316,11 @@ def main(argv: Iterable[str] | None = None) -> int:
         values = " ".join(f"{int(v):4d}" for v in output[row].to(torch.int32))
         print(f"{row:4d}: {values}")
     print(f"checksum: 0x{checksum_q7(output):08x}")
+
+    if args.dump_output is not None:
+        flat = ((output.to(torch.int32).reshape(-1) + 256) & 0xFF).to(torch.uint8)
+        args.dump_output.write_bytes(bytes(flat.tolist()))
+
     return 0
 
 
