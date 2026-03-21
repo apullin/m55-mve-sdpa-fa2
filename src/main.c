@@ -12,6 +12,29 @@
 #endif
 
 #define ALIGN_16 __attribute__((aligned(16)))
+#define USED_NOINLINE __attribute__((used, noinline))
+
+#if defined(__ARM_FEATURE_MVE) && (__ARM_FEATURE_MVE)
+#define TILED_ATTENTION_COMPILER_MVE 1
+#else
+#define TILED_ATTENTION_COMPILER_MVE 0
+#endif
+
+#if defined(ARM_MATH_MVEI)
+#define TILED_ATTENTION_CMSIS_MVEI 1
+#else
+#define TILED_ATTENTION_CMSIS_MVEI 0
+#endif
+
+#if defined(ARM_MATH_AUTOVECTORIZE)
+#define TILED_ATTENTION_AUTOVEC_DISABLED 0
+#else
+#define TILED_ATTENTION_AUTOVEC_DISABLED 1
+#endif
+
+#if defined(TILED_ATTENTION_REQUIRE_MVE) && (!TILED_ATTENTION_COMPILER_MVE || !TILED_ATTENTION_CMSIS_MVEI)
+#error "TILED_ATTENTION_REQUIRE_MVE expects both __ARM_FEATURE_MVE and ARM_MATH_MVEI to be enabled"
+#endif
 
 typedef struct {
     /* Repeated regions accumulate raw start/end timestamps; finalize computes end_sum - start_sum. */
@@ -26,6 +49,7 @@ typedef struct {
     cycle_span_t run_model;
     cycle_span_t classify;
     cycle_span_t layer_total[NUM_LAYERS];
+    cycle_span_t layer_attn_norm[NUM_LAYERS];
     cycle_span_t layer_ffn[NUM_LAYERS];
     cycle_span_t head_kv_cache[NUM_LAYERS][NUM_HEADS];
     cycle_span_t head_q_proj[NUM_LAYERS][NUM_HEADS];
@@ -40,6 +64,7 @@ typedef struct {
     q7_t ALIGN_16 hidden_a[INPUT_SEQ_LEN * MODEL_DIM];
     q7_t ALIGN_16 hidden_b[INPUT_SEQ_LEN * MODEL_DIM];
     q7_t ALIGN_16 output[OUTPUT_SEQ_LEN * NUM_CLASSES];
+    q7_t ALIGN_16 attn_norm_sequence[INPUT_SEQ_LEN * MODEL_DIM];
 
     q7_t ALIGN_16 head_k_cache[INPUT_SEQ_LEN * HEAD_DIM];
     q7_t ALIGN_16 head_v_cache[INPUT_SEQ_LEN * HEAD_DIM];
@@ -61,6 +86,42 @@ typedef struct {
     /* The profiler state lives alongside the buffers so debugger inspection follows the same lifetime. */
     volatile model_cycle_profile_t cycle_profile;
 } tiled_attention_ctx_t;
+
+/* Keep one tiny, obvious Helium probe in the final image so objdump can answer "did MVE survive integration?" */
+static USED_NOINLINE int32_t tiled_attention_mve_probe_dot_16(const q7_t *a, const q7_t *b)
+{
+#if defined(ARM_MATH_MVEI) && !defined(ARM_MATH_AUTOVECTORIZE)
+    return vmladavaq(0, vld1q(a), vld1q(b));
+#else
+    q31_t sum = 0;
+    arm_dot_prod_q7(a, b, 16U, &sum);
+    return sum;
+#endif
+}
+
+static uint32_t tiled_attention_mve_probe_value(void)
+{
+    static const q7_t ALIGN_16 probe_a[16] = {
+        1, 2, 3, 4, 5, 6, 7, 8,
+        9, 10, 11, 12, 13, 14, 15, 16
+    };
+    static const q7_t ALIGN_16 probe_b[16] = {
+        16, 15, 14, 13, 12, 11, 10, 9,
+        8, 7, 6, 5, 4, 3, 2, 1
+    };
+
+    return (uint32_t)tiled_attention_mve_probe_dot_16(probe_a, probe_b);
+}
+
+static void print_mve_build_info(void)
+{
+    printf(
+        "mve-build: compiler_mve=%u cmsis_mvei=%u autovec_disabled=%u probe=0x%08lx\n",
+        (unsigned)TILED_ATTENTION_COMPILER_MVE,
+        (unsigned)TILED_ATTENTION_CMSIS_MVEI,
+        (unsigned)TILED_ATTENTION_AUTOVEC_DISABLED,
+        (unsigned long)tiled_attention_mve_probe_value());
+}
 
 static tiled_attention_ctx_t *alloc_tiled_attention_ctx(void)
 {
@@ -156,6 +217,7 @@ static void cycle_profile_finalize(tiled_attention_ctx_t *ctx)
 
     for (uint32_t layer_idx = 0; layer_idx < NUM_LAYERS; ++layer_idx) {
         cycle_span_finalize(&ctx->cycle_profile.layer_total[layer_idx]);
+        cycle_span_finalize(&ctx->cycle_profile.layer_attn_norm[layer_idx]);
         cycle_span_finalize(&ctx->cycle_profile.layer_ffn[layer_idx]);
 
         for (uint32_t head_idx = 0; head_idx < NUM_HEADS; ++head_idx) {
@@ -186,6 +248,9 @@ static void print_cycle_profile_summary(const tiled_attention_ctx_t *ctx)
             (unsigned long)layer_idx,
             (unsigned long long)ctx->cycle_profile.layer_total[layer_idx].cycles,
             (unsigned long long)ctx->cycle_profile.layer_ffn[layer_idx].cycles);
+        printf("cycle-profile: layer%lu attn-norm=%llu\n",
+            (unsigned long)layer_idx,
+            (unsigned long long)ctx->cycle_profile.layer_attn_norm[layer_idx].cycles);
 
         for (uint32_t head_idx = 0; head_idx < NUM_HEADS; ++head_idx) {
             printf(
@@ -241,9 +306,12 @@ static q7_t sat_q7(int32_t value)
     return (q7_t)value;
 }
 
-static int32_t round_float_to_i32(float value)
+static int32_t div_round_s64(int64_t numer, int64_t denom)
 {
-    return (value >= 0.0f) ? (int32_t)(value + 0.5f) : (int32_t)(value - 0.5f);
+    if (numer >= 0) {
+        return (int32_t)((numer + (denom / 2)) / denom);
+    }
+    return (int32_t)((numer - (denom / 2)) / denom);
 }
 
 static uint32_t min_u32(uint32_t a, uint32_t b)
@@ -333,19 +401,34 @@ static void rmsnorm_q7_block(
         const q7_t *input_row = input_block + row * cols;
         q7_t *output_row = output_block + row * cols;
         q31_t sum_sq = 0;
+        q31_t mean_sq_q31;
+        q31_t rms_q31;
+        int32_t rms_q8;
+        int32_t inv_rms_q16;
 
-        /* Pre-RMSNorm: keep the reduction cheap with q7 dot, then do the sqrt/scale in float. */
+        /* Pre-RMSNorm: keep the reduction cheap with q7 dot and stay in fixed-point for the scale. */
         arm_dot_prod_q7(input_row, input_row, cols, &sum_sq);
 
-        {
-            float mean_sq = (float)sum_sq / (float)cols;
-            float inv_rms = 1.0f / sqrtf(mean_sq + 1.0e-5f);
+        if (sum_sq <= 0) {
+            arm_fill_q7(0, output_row, cols);
+            continue;
+        }
 
-            for (uint32_t col = 0; col < cols; ++col) {
-                float gamma = (float)weight_q14[col] / (float)RMS_NORM_WEIGHT_ONE;
-                float normalized = (float)input_row[col] * inv_rms * gamma;
-                output_row[col] = sat_q7(round_float_to_i32(normalized));
-            }
+        mean_sq_q31 = (q31_t)((((int64_t)sum_sq << RMS_NORM_MEAN_Q31_SHIFT) + (cols / 2)) / cols);
+        check_status(arm_sqrt_q31(mean_sq_q31, &rms_q31), "arm_sqrt_q31");
+
+        rms_q8 = (int32_t)((rms_q31 + (1 << (31 - RMS_NORM_INPUT_SHIFT - RMS_NORM_RMS_SHIFT - 1))) >>
+            (31 - RMS_NORM_INPUT_SHIFT - RMS_NORM_RMS_SHIFT));
+        if (rms_q8 <= 0) {
+            arm_fill_q7(0, output_row, cols);
+            continue;
+        }
+
+        inv_rms_q16 = (int32_t)((((int64_t)1 << (RMS_NORM_INV_SHIFT + RMS_NORM_RMS_SHIFT)) + (rms_q8 / 2)) / rms_q8);
+
+        for (uint32_t col = 0; col < cols; ++col) {
+            int64_t numer = (int64_t)input_row[col] * weight_q14[col] * inv_rms_q16;
+            output_row[col] = sat_q7(div_round_s64(numer, (int64_t)RMS_NORM_WEIGHT_ONE << RMS_NORM_INV_SHIFT));
         }
     }
 }
@@ -695,7 +778,7 @@ static void maybe_dump_output(const q7_t *output, uint32_t count)
 
 static void run_attention_head_block_with_cache(
     tiled_attention_ctx_t *ctx,
-    const q7_t *input_sequence,
+    const q7_t *attn_norm_sequence,
     const model_layer_t *layer,
     uint32_t layer_idx,
     uint32_t head_idx,
@@ -705,18 +788,10 @@ static void run_attention_head_block_with_cache(
 {
     cycle_span_begin(ctx, &ctx->cycle_profile.head_q_proj[layer_idx][head_idx]);
 
-    /* Pre-norm the query tile before the attention projections. */
-    rmsnorm_q7_block(
-        input_sequence + query_start * MODEL_DIM,
-        (uint16_t)query_rows,
-        MODEL_DIM,
-        layer->rms_attn_w_q14,
-        ctx->norm_tile);
-
-    /* Project just the active query tile for this head. */
+    /* Reuse the layer-wide attention-normalized sequence and only project the active query tile. */
     q7_linear_block(
         ctx,
-        ctx->norm_tile,
+        attn_norm_sequence + query_start * MODEL_DIM,
         (uint16_t)query_rows,
         MODEL_DIM,
         &layer->w_q[head_idx][0][0],
@@ -800,27 +875,37 @@ static void run_attention_head_block_with_cache(
     cycle_span_end(ctx, &ctx->cycle_profile.head_normalize[layer_idx][head_idx]);
 }
 
-static void build_head_kv_cache(
+static void build_attn_norm_sequence(
     tiled_attention_ctx_t *ctx,
     const q7_t *input_sequence,
+    const model_layer_t *layer)
+{
+    for (uint32_t tile_start = 0; tile_start < INPUT_SEQ_LEN; tile_start += QUERY_TILE) {
+        uint32_t tile_rows = min_u32(QUERY_TILE, INPUT_SEQ_LEN - tile_start);
+
+        /* Materialize the attention pre-norm once per layer so every head reuses the same rows. */
+        rmsnorm_q7_block(
+            input_sequence + tile_start * MODEL_DIM,
+            (uint16_t)tile_rows,
+            MODEL_DIM,
+            layer->rms_attn_w_q14,
+            ctx->attn_norm_sequence + tile_start * MODEL_DIM);
+    }
+}
+
+static void build_head_kv_cache(
+    tiled_attention_ctx_t *ctx,
+    const q7_t *attn_norm_sequence,
     const model_layer_t *layer,
     uint32_t head_idx)
 {
     for (uint32_t tile_start = 0; tile_start < INPUT_SEQ_LEN; tile_start += QUERY_TILE) {
         uint32_t tile_rows = min_u32(QUERY_TILE, INPUT_SEQ_LEN - tile_start);
 
-        /* Pre-norm one sequence tile and reuse it for both K and V projections. */
-        rmsnorm_q7_block(
-            input_sequence + tile_start * MODEL_DIM,
-            (uint16_t)tile_rows,
-            MODEL_DIM,
-            layer->rms_attn_w_q14,
-            ctx->norm_tile);
-
-        /* Materialize this head's full K sequence once so all query tiles can reuse it. */
+        /* Project K/V from the shared attention-normalized sequence. */
         q7_linear_block(
             ctx,
-            ctx->norm_tile,
+            attn_norm_sequence + tile_start * MODEL_DIM,
             (uint16_t)tile_rows,
             MODEL_DIM,
             &layer->w_k[head_idx][0][0],
@@ -831,7 +916,7 @@ static void build_head_kv_cache(
         /* Materialize this head's full V sequence once for the same reason. */
         q7_linear_block(
             ctx,
-            ctx->norm_tile,
+            attn_norm_sequence + tile_start * MODEL_DIM,
             (uint16_t)tile_rows,
             MODEL_DIM,
             &layer->w_v[head_idx][0][0],
@@ -853,12 +938,16 @@ static void run_transformer_layer(
 {
     cycle_span_begin(ctx, &ctx->cycle_profile.layer_total[layer_idx]);
 
+    cycle_span_begin(ctx, &ctx->cycle_profile.layer_attn_norm[layer_idx]);
+    build_attn_norm_sequence(ctx, current_sequence, layer);
+    cycle_span_end(ctx, &ctx->cycle_profile.layer_attn_norm[layer_idx]);
+
     /* First phase: accumulate all head outputs into the next 24-wide sequence buffer. */
     arm_fill_q7(0, next_sequence, INPUT_SEQ_LEN * MODEL_DIM);
 
     for (uint32_t head_idx = 0; head_idx < NUM_HEADS; ++head_idx) {
         cycle_span_begin(ctx, &ctx->cycle_profile.head_kv_cache[layer_idx][head_idx]);
-        build_head_kv_cache(ctx, current_sequence, layer, head_idx);
+        build_head_kv_cache(ctx, ctx->attn_norm_sequence, layer, head_idx);
         cycle_span_end(ctx, &ctx->cycle_profile.head_kv_cache[layer_idx][head_idx]);
 
         for (uint32_t query_start = 0; query_start < INPUT_SEQ_LEN; query_start += QUERY_TILE) {
@@ -868,7 +957,7 @@ static void run_transformer_layer(
             /* Run this head against all cached K/V rows and emit one 16-wide context tile. */
             run_attention_head_block_with_cache(
                 ctx,
-                current_sequence,
+                ctx->attn_norm_sequence,
                 layer,
                 layer_idx,
                 head_idx,
@@ -901,7 +990,7 @@ static void run_transformer_layer(
 
     cycle_span_begin(ctx, &ctx->cycle_profile.layer_ffn[layer_idx]);
 
-    /* Second phase: apply output bias, residual, and the 24->24->24 feed-forward block tile by tile. */
+    /* Second phase: apply output bias, residual, and the widened 24->48->24 feed-forward block tile by tile. */
     for (uint32_t query_start = 0; query_start < INPUT_SEQ_LEN; query_start += QUERY_TILE) {
         uint32_t query_rows = min_u32(QUERY_TILE, INPUT_SEQ_LEN - query_start);
         uint32_t tile_elems = query_rows * MODEL_DIM;
@@ -1017,6 +1106,7 @@ int main(void)
     }
 
     ctx = alloc_tiled_attention_ctx();
+    print_mve_build_info();
     cycle_profile_init(ctx);
 
     /* Populate the fixed-size input tensor. */

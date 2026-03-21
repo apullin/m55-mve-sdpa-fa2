@@ -9,6 +9,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 option(ARM_M55_MVE "Enable CMSIS-DSP Helium options for Cortex-M55 builds" OFF)
 option(ARM_M55_QEMU "Build a bare-metal Cortex-M55 binary for QEMU mps3-an547" OFF)
 option(ARM_PROFILE_CYCLES "Enable DWT cycle profiling on Cortex-M55 builds" OFF)
+option(ARM_REQUIRE_MVE "Fail Cortex-M55 builds if Helium/MVE support is not active" ON)
 set(ARM_FLOAT_ABI "hard" CACHE STRING "Floating-point ABI for Cortex-M55 cross builds (softfp or hard)")
 
 set(MODEL_DIM 24 CACHE STRING "Model feature dimension")
@@ -127,6 +128,8 @@ if(ARM_M55_QEMU)
     "../CMSIS-DSP/Source/BasicMathFunctions/arm_add_q7.c"
     "../CMSIS-DSP/Source/BasicMathFunctions/arm_clip_q7.c"
     "../CMSIS-DSP/Source/BasicMathFunctions/arm_dot_prod_q7.c"
+    "../CMSIS-DSP/Source/FastMathFunctions/arm_sqrt_q31.c"
+    "../CMSIS-DSP/Source/CommonTables/arm_common_tables.c"
     "../CMSIS-DSP/Source/SupportFunctions/arm_fill_q7.c"
     "../CMSIS-DSP/Source/SupportFunctions/arm_copy_q7.c"
     "${CMSIS_5_DIR}/Device/ARM/ARMCM55/Source/startup_ARMCM55.c"
@@ -144,6 +147,9 @@ if(ARM_M55_QEMU)
   )
 
   target_compile_definitions(tiled_attention PRIVATE ARMCM55 _GNU_SOURCE ARM_MATH_LOOPUNROLL)
+  if(ARM_REQUIRE_MVE)
+    target_compile_definitions(tiled_attention PRIVATE TILED_ATTENTION_REQUIRE_MVE)
+  endif()
   if(ARM_PROFILE_CYCLES)
     target_compile_definitions(tiled_attention PRIVATE TILED_ATTENTION_PROFILE_CYCLES)
   endif()

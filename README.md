@@ -33,8 +33,8 @@ The FFN width is configurable at build time with `-DMODEL_FFN_DIM=...` without c
 
 Each transformer block runs in two phases:
 
-1. Per head:
-   apply pre-RMSNorm to the active input rows
+1. Per layer and per head:
+   build one shared attention-normalized sequence for the layer
    project `Q`, `K`, `V`
    apply RoPE to `Q` and `K`
    compute tiled score blocks `Q_tile @ K_tile^T`
@@ -59,8 +59,9 @@ The important tricks are:
 
 - the full working set now lives in one runtime context allocation, so firmware can reserve it only for the duration of inference
 - only two full `1200 x 24` sequence buffers are live at once
+- one full `1200 x 24` attention-normalized sequence is materialized per layer so both heads can reuse it
 - only one head's full `K` cache and one head's full `V` cache are materialized at a time
-- RMSNorm is applied tile-by-tile, so there is no extra full-sequence normalized buffer
+- FFN-side RMSNorm is still applied tile-by-tile, so there is no second full-sequence normalized buffer
 - there is no full `Q`, `K`, `V`, attention-score, or probability tensor for the whole sequence
 - each head context tile is projected through its `W_o` slice immediately, so there is no full `1200 x 32` attention output buffer
 - score tiles are stored as compact `int16` scratch and consumed immediately by the online softmax/value pass
@@ -92,7 +93,7 @@ The final divide in normalization is still scalar because MVE does not provide v
 `tools/torch_reference.py` mirrors the fixed-point edge path instead of using `torch.sdpa`. That is intentional: standard SDPA is not bit-equivalent to this implementation because this repo uses:
 
 - q7 GEMM semantics
-- q14 RMSNorm weights with float RMS evaluation and q7 requantization
+- q14 RMSNorm weights with fixed-point RMS evaluation, q31 sqrt, and q7 requantization
 - q15 RoPE tables
 - q12 LUT-based softmax decay
 - online renormalized softmax accumulation
@@ -142,6 +143,58 @@ cmake --build build-qemu --target run_qemu
 For the full `1200`-token shape under QEMU, omit `-DMODEL_INPUT_SEQ_LEN=128`. QEMU is useful for correctness and smoke testing, not for meaningful M55 timing.
 
 The bare-metal QEMU linker script reserves heap for that one-shot context allocation, matching the intended on-device lifetime model.
+
+## QEMU Baseline Compare
+
+The repo also includes a relative regression harness for comparing the current tree against the last committed baseline under QEMU:
+
+```sh
+/Users/andrewpullin/anaconda3/bin/python3.12 tools/compare_qemu_baseline.py \
+  --input-seq-len 128 \
+  --runs 3
+```
+
+What it does:
+
+- builds host and QEMU binaries for the current tree
+- builds host and QEMU binaries for baseline commit `1d2347c`
+- checks host checksum == QEMU checksum for each variant
+- reports repeated QEMU wall-time as a relative-only proxy
+
+Use `--input-seq-len 1200` when you want the deployed shape instead of the smoke shape.
+
+Important caveat: QEMU timing here is only for comparing two binaries against each other. It is not a real M55 timing number.
+
+## Verifying MVE Survived Integration
+
+If you integrate this code into a larger firmware tree, the two easiest checks are:
+
+- runtime banner: the program prints one line of build info before inference:
+  `mve-build: compiler_mve=... cmsis_mvei=... autovec_disabled=... probe=...`
+- disassembly probe: `src/main.c` keeps a `used,noinline` helper named `tiled_attention_mve_probe_dot_16`
+
+For a real M55+Helium build, you want:
+
+- `compiler_mve=1`
+- `cmsis_mvei=1`
+- `autovec_disabled=1`
+
+If any of those are wrong, the build is not on the intended MVE path.
+
+The `ARM_REQUIRE_MVE` CMake option defaults to `ON` for Cortex-M55 builds in this repo. That adds a compile-time guard so the build fails if `__ARM_FEATURE_MVE` or `ARM_MATH_MVEI` is missing.
+
+To inspect the probe in a cross-built binary:
+
+```sh
+arm-none-eabi-objdump -d build-qemu/tiled_attention | rg -n "tiled_attention_mve_probe_dot_16|vmlava|vldrb"
+```
+
+In the probe body, look for Helium instructions such as:
+
+- `vmlava.s8`
+- `vldrb.*`
+
+Those are the clearest sign that the binary still contains the intended MVE dot-product path.
 
 ## Cycle Profiling
 

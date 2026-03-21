@@ -3,7 +3,7 @@
 
 This intentionally mirrors the C implementation's fixed-point dataflow:
 - q7 GEMM semantics for the linear layers
-- q14 RMSNorm weights with float RMS evaluation and q7 requantization
+- q14 RMSNorm weights with fixed-point RMS evaluation and q7 requantization
 - q15 RoPE tables
 - streamed online softmax with the same q12 LUT
 - q7 residual / bias saturation
@@ -19,6 +19,7 @@ Python-only dropout knob for training-side experiments.
 from __future__ import annotations
 
 import argparse
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -78,6 +79,21 @@ def symmetric_round_float(x: torch.Tensor) -> torch.Tensor:
     pos = torch.trunc(x + 0.5)
     neg = torch.trunc(x - 0.5)
     return torch.where(x >= 0, pos, neg).to(torch.int32)
+
+
+def div_round_signed(numer: torch.Tensor, denom: int) -> torch.Tensor:
+    half = denom // 2
+    pos = torch.div(numer + half, denom, rounding_mode="trunc")
+    neg = torch.div(numer - half, denom, rounding_mode="trunc")
+    return torch.where(numer >= 0, pos, neg)
+
+
+def isqrt_u64(x: torch.Tensor) -> torch.Tensor:
+    if hasattr(torch, "isqrt"):
+        return torch.isqrt(x)
+
+    flat = [math.isqrt(int(value)) for value in x.reshape(-1).tolist()]
+    return torch.tensor(flat, dtype=torch.int64, device=x.device).reshape_as(x)
 
 
 def build_demo_input(cfg: ModelConfig) -> torch.Tensor:
@@ -153,12 +169,32 @@ class EdgeReferenceModel(nn.Module):
         return add_q7(out, bias.view(1, -1).expand_as(out))
 
     def rmsnorm_q7_block(self, input_block: torch.Tensor, weight_q14: torch.Tensor) -> torch.Tensor:
-        x = input_block.to(torch.float32)
-        mean_sq = (x * x).mean(dim=1, keepdim=True)
-        inv_rms = torch.reciprocal(torch.sqrt(mean_sq + 1.0e-5))
-        gamma = weight_q14.to(torch.float32).view(1, -1) / float(modelgen.RMS_NORM_WEIGHT_ONE)
-        normalized = x * inv_rms * gamma
-        return sat_q7(symmetric_round_float(normalized))
+        x = input_block.to(torch.int64)
+        sum_sq = (x * x).sum(dim=1)
+        output = torch.zeros_like(input_block, dtype=torch.int32)
+        nonzero = sum_sq > 0
+
+        if not torch.any(nonzero):
+            return output
+
+        mean_sq_q31 = (
+            (sum_sq[nonzero] << modelgen.RMS_NORM_MEAN_Q31_SHIFT) + (self.cfg.model_dim // 2)
+        ) // self.cfg.model_dim
+        rms_q31 = isqrt_u64(mean_sq_q31 << 31)
+        q31_to_rms_shift = 31 - modelgen.RMS_NORM_INPUT_SHIFT - modelgen.RMS_NORM_RMS_SHIFT
+        rms_q8 = (rms_q31 + (1 << (q31_to_rms_shift - 1))) >> q31_to_rms_shift
+        inv_rms_q16 = (
+            (1 << (modelgen.RMS_NORM_INV_SHIFT + modelgen.RMS_NORM_RMS_SHIFT)) + (rms_q8 // 2)
+        ) // rms_q8
+
+        numer = (
+            x[nonzero]
+            * weight_q14.to(torch.int64).view(1, -1)
+            * inv_rms_q16.view(-1, 1)
+        )
+        denom = modelgen.RMS_NORM_WEIGHT_ONE << modelgen.RMS_NORM_INV_SHIFT
+        output[nonzero] = sat_q7(div_round_signed(numer, denom))
+        return output
 
     def maybe_dropout_q7(self, block: torch.Tensor) -> torch.Tensor:
         if (not self.training) or (self.cfg.dropout_p <= 0.0):
@@ -197,16 +233,26 @@ class EdgeReferenceModel(nn.Module):
         out[in_range] = self.softmax_lut[delta[in_range].to(torch.long)]
         return out
 
-    def build_head_kv_cache(self, sequence: torch.Tensor, layer: ReferenceLayer, head_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        normed = self.rmsnorm_q7_block(sequence, layer.rms_attn_w_q14)
-        k_cache = self.q7_linear_block(normed, layer.w_k[head_idx], None)
+    def build_attn_norm_sequence(self, sequence: torch.Tensor, layer: ReferenceLayer) -> torch.Tensor:
+        attn_norm = torch.empty_like(sequence)
+
+        for tile_start in range(0, self.cfg.input_seq_len, self.cfg.query_tile):
+            tile_rows = min(self.cfg.query_tile, self.cfg.input_seq_len - tile_start)
+            attn_norm[tile_start : tile_start + tile_rows] = self.rmsnorm_q7_block(
+                sequence[tile_start : tile_start + tile_rows], layer.rms_attn_w_q14
+            )
+
+        return attn_norm
+
+    def build_head_kv_cache(self, attn_norm: torch.Tensor, layer: ReferenceLayer, head_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        k_cache = self.q7_linear_block(attn_norm, layer.w_k[head_idx], None)
         k_cache = self.apply_rope_q7(k_cache, 0)
-        v_cache = self.q7_linear_block(normed, layer.w_v[head_idx], None)
+        v_cache = self.q7_linear_block(attn_norm, layer.w_v[head_idx], None)
         return k_cache, v_cache
 
     def run_attention_head_block_with_cache(
         self,
-        sequence: torch.Tensor,
+        attn_norm: torch.Tensor,
         layer: ReferenceLayer,
         head_idx: int,
         query_start: int,
@@ -214,10 +260,7 @@ class EdgeReferenceModel(nn.Module):
         head_k_cache: torch.Tensor,
         head_v_cache: torch.Tensor,
     ) -> torch.Tensor:
-        normed_query = self.rmsnorm_q7_block(
-            sequence[query_start : query_start + query_rows], layer.rms_attn_w_q14
-        )
-        query_tile = self.q7_linear_block(normed_query, layer.w_q[head_idx], None)
+        query_tile = self.q7_linear_block(attn_norm[query_start : query_start + query_rows], layer.w_q[head_idx], None)
         query_tile = self.apply_rope_q7(query_tile, query_start)
 
         row_max = torch.full((query_rows,), -(1 << 15), dtype=torch.int32)
@@ -271,14 +314,15 @@ class EdgeReferenceModel(nn.Module):
 
     def run_transformer_layer(self, current_sequence: torch.Tensor, layer: ReferenceLayer) -> torch.Tensor:
         next_sequence = torch.zeros_like(current_sequence)
+        attn_norm_sequence = self.build_attn_norm_sequence(current_sequence, layer)
 
         for head_idx in range(self.cfg.num_heads):
-            head_k_cache, head_v_cache = self.build_head_kv_cache(current_sequence, layer, head_idx)
+            head_k_cache, head_v_cache = self.build_head_kv_cache(attn_norm_sequence, layer, head_idx)
 
             for query_start in range(0, self.cfg.input_seq_len, self.cfg.query_tile):
                 query_rows = min(self.cfg.query_tile, self.cfg.input_seq_len - query_start)
                 head_context = self.run_attention_head_block_with_cache(
-                    current_sequence,
+                    attn_norm_sequence,
                     layer,
                     head_idx,
                     query_start,
